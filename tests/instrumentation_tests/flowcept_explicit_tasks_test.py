@@ -5,13 +5,12 @@ import pytest
 from pathlib import Path
 from time import sleep
 
-from flowcept.commons.vocabulary import Status
+from flowcept.commons.vocabulary import PROV_AGENT, Status
 from flowcept import Flowcept, FlowceptTask
 from flowcept import configs
 
 
 class ExplicitTaskTest(unittest.TestCase):
-
     def test_task_capture(self):
         with Flowcept():
             used_args = {"a": 1}
@@ -62,6 +61,9 @@ class ExplicitTaskTest(unittest.TestCase):
         assert "telemetry_at_start" not in no_telemetry_task
         assert "telemetry_at_end" not in no_telemetry_task
 
+    def test_decision_provenance_subtype(self):
+        assert PROV_AGENT.DECISION.value == "decision"
+
     @pytest.mark.safeoffline
     def test_custom_tasks(self):
         if not configs.DUMP_BUFFER_ENABLED:
@@ -70,7 +72,7 @@ class ExplicitTaskTest(unittest.TestCase):
         flowcept = Flowcept(start_persistence=False, save_workflow=True, workflow_name="MyFirstWorkflow").start()
 
         agent1 = str(uuid.uuid4())
-        FlowceptTask(activity_id="super_func1", used={"x":1}, agent_id=agent1, tags=["tag1"]).send()
+        FlowceptTask(activity_id="super_func1", used={"x": 1}, agent_id=agent1, tags=["tag1"]).send()
 
         with FlowceptTask(activity_id="super_func2", used={"y": 1}, agent_id=agent1, tags=["tag2"]) as t2:
             sleep(0.5)
@@ -78,7 +80,7 @@ class ExplicitTaskTest(unittest.TestCase):
 
         t3 = FlowceptTask(activity_id="super_func3", used={"z": 1}, agent_id=agent1, tags=["tag3"])
         sleep(0.1)
-        t3.end(generated={"w":1})
+        t3.end(generated={"w": 1})
 
         workflow_id = Flowcept.current_workflow_id
         flowcept.stop()
@@ -127,9 +129,15 @@ class ExplicitTaskTest(unittest.TestCase):
                 with open(img_path, "rb") as fp:
                     img_data = fp.read()
 
-                t.end(generated={"b": 2}, data=img_data, custom_metadata={
-                    "mime_type": "application/pdf", "file_name": "flowcept-logo.png", "file_extension": "pdf"}
-                      )
+                t.end(
+                    generated={"b": 2},
+                    data=img_data,
+                    custom_metadata={
+                        "mime_type": "application/pdf",
+                        "file_name": "flowcept-logo.png",
+                        "file_extension": "pdf",
+                    },
+                )
                 t.send()
 
             with FlowceptTask(used=used_args) as t:
@@ -138,55 +146,33 @@ class ExplicitTaskTest(unittest.TestCase):
                 with open(img_path, "rb") as fp:
                     img_data = fp.read()
 
-                t.end(generated={"c": 2}, data=img_data, custom_metadata={
-                    "mime_type": "image/png", "file_name": "flowcept-logo.png", "file_extension": "png"}
-                      )
+                t.end(
+                    generated={"c": 2},
+                    data=img_data,
+                    custom_metadata={
+                        "mime_type": "image/png",
+                        "file_name": "flowcept-logo.png",
+                        "file_extension": "png",
+                    },
+                )
                 t.send()
 
             assert len(Flowcept.buffer) == 3
             assert Flowcept.buffer[1]["data"]
-            #assert Flowcept.buffer[1]["data"].startswith(b"\x89PNG")
-
+            # assert Flowcept.buffer[1]["data"].startswith(b"\x89PNG")
 
     @pytest.mark.safeoffline
     def test_prov_query_msg(self):
         with Flowcept():
-            FlowceptTask(
-                activity_id="hmi_message",
-                subtype="agent_task",
-                used={
-                    "n": 1
-                }
-            ).send()
+            FlowceptTask(activity_id="hmi_message", subtype="agent_task", used={"n": 1}).send()
             sleep(1)
-            FlowceptTask(
-                activity_id="reset_user_context",
-                subtype="call_agent_task",
-                used={}
-            ).send()
+            FlowceptTask(activity_id="reset_user_context", subtype="call_agent_task", used={}).send()
             sleep(1)
-            FlowceptTask(
-                activity_id="hmi_message",
-                subtype="agent_task",
-                used={
-                    "n": 2
-                }
-            ).send()
+            FlowceptTask(activity_id="hmi_message", subtype="agent_task", used={"n": 2}).send()
             sleep(1)
-            FlowceptTask(
-                activity_id="hmi_message",
-                subtype="agent_task",
-                used={
-                    "n": 3
-                }
-            ).send()
-
+            FlowceptTask(activity_id="hmi_message", subtype="agent_task", used={"n": 3}).send()
 
     @pytest.mark.safeoffline
     def test_prov_query_msg2(self):
         with Flowcept():
-            FlowceptTask(
-                activity_id="reset_user_context",
-                subtype="call_agent_task",
-                used={}
-            ).send()
+            FlowceptTask(activity_id="reset_user_context", subtype="call_agent_task", used={}).send()

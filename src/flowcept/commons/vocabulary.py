@@ -116,3 +116,6 @@ class PROV_AGENT(str, Enum):
     decorator (applied to MCP tools and LangGraph tool nodes).  Recorded
     fields: ``used`` = tool input arguments, ``generated`` = tool return value.
     """
+
+    DECISION = "decision"
+    """Generation, evaluation, or selection among explicit candidate alternatives."""

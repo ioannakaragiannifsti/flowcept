@@ -77,6 +77,28 @@ def __getattr__(name):
         from flowcept.configs import SETTINGS_PATH
 
         return SETTINGS_PATH
+
+    elif name in {"Candidate", "Assessment", "DecisionRecord"}:
+        from flowcept.commons.flowcept_dataclasses.decision_provenance import (
+            Assessment,
+            Candidate,
+            DecisionRecord,
+        )
+
+        return {
+            "Candidate": Candidate,
+            "Assessment": Assessment,
+            "DecisionRecord": DecisionRecord,
+        }[name]
+
+    elif name == "record_decision":
+        from flowcept.instrumentation.decision_provenance import record_decision
+
+        return record_decision
+    elif name == "DecisionCapture":
+        from flowcept.instrumentation.decision_provenance import DecisionCapture
+
+        return DecisionCapture
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
@@ -93,6 +115,11 @@ __all__ = [
     "WorkflowObject",
     "BlobObject",
     "AgentObject",
+    "Candidate",
+    "Assessment",
+    "DecisionRecord",
+    "record_decision",
+    "DecisionCapture",
     "__version__",
     "SETTINGS_PATH",
 ]
