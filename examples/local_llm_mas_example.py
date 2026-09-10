@@ -161,8 +161,8 @@ def run_simulation(model_name: str = "qwen3:4b") -> tuple[str, str]:
             "incident-commander-agent",
             "incident commander",
             (
-                "Make the final operational decision. State whether to execute, modify, or reject the plan; list "
-                "approved steps in order; and explain how the evidence and risk review support the decision."
+                "Make the final operational decision. Begin with exactly DECISION: EXECUTE, DECISION: MODIFY, or "
+                "DECISION: REJECT. Then list approved steps and explain how the evidence and risk review support it."
             ),
             {
                 "incident": INCIDENT,

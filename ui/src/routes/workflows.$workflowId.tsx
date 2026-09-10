@@ -13,6 +13,7 @@ import { DeleteConfirmModal } from "../components/DeleteConfirmModal";
 import { DagView } from "../components/charts/DagView";
 import { DataflowView } from "../components/charts/DataflowView";
 import { CoarseDataflowView } from "../components/charts/CoarseDataflowView";
+import { DecisionCandidatesView } from "../components/charts/DecisionCandidatesView";
 import { GanttChart } from "../components/charts/GanttChart";
 import { StatusStrip } from "../components/charts/StatusStrip";
 import { TelemetryChart, TelemetryEmptyMessage } from "../components/charts/TelemetryChart";
@@ -559,7 +560,7 @@ function MetricCard({ label, value }: { label: string; value: string }) {
 }
 
 function GraphTab({ tasks, workflowId }: { tasks: Task[]; workflowId: string }) {
-  const [graphType, setGraphType] = useState<"activity" | "task" | "provenance">("activity");
+  const [graphType, setGraphType] = useState<"activity" | "task" | "provenance" | "candidates">("activity");
   const [provMode, setProvMode] = useState<"coarse" | "fine">("coarse");
   const [isMaximized, setIsMaximized] = useState(false);
 
@@ -595,6 +596,7 @@ function GraphTab({ tasks, workflowId }: { tasks: Task[]; workflowId: string }) 
                   ["activity", "Activity Graph"],
                   ["task", "Task Graph"],
                   ["provenance", "Provenance Graph"],
+                  ["candidates", "Decision Candidates"],
                 ] as const
               ).map(([key, label]) => (
                 <button
@@ -626,6 +628,7 @@ function GraphTab({ tasks, workflowId }: { tasks: Task[]; workflowId: string }) 
               {graphType === "task" && "Individual task executions."}
               {graphType === "provenance" && provMode === "coarse" && "Tasks grouped by activity — each node aggregates all runs of the same activity."}
               {graphType === "provenance" && provMode === "fine" && "How data flows between tasks, derived from inputs and outputs."}
+              {graphType === "candidates" && "Alternatives, assessments, evidence, and the selected result."}
             </span>
           </div>
 
@@ -644,6 +647,8 @@ function GraphTab({ tasks, workflowId }: { tasks: Task[]; workflowId: string }) 
             <CoarseDataflowView workflowId={workflowId} height={isMaximized ? "100%" : undefined} />
           ) : graphType === "provenance" && provMode === "fine" ? (
             <DataflowView workflowId={workflowId} height={isMaximized ? "100%" : undefined} />
+          ) : graphType === "candidates" ? (
+            <DecisionCandidatesView tasks={tasks} height={isMaximized ? "100%" : undefined} />
           ) : (
             <DagView tasks={tasks} mode={graphType as "activity" | "task"} height={isMaximized ? "100%" : undefined} />
           )}
