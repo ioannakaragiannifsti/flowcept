@@ -160,6 +160,50 @@ The UI provides:
 
 See the [Web UI docs](https://flowcept.readthedocs.io/en/latest/web_ui.html) and [ui/README.md](ui/README.md).
 
+### Inspect The Decision-Provenance MAS In The UI
+
+The Child Presence Detection MAS example records agent activities, alternatives,
+assessments, the selected test strategy, and the human review decision. MongoDB and
+Redis must be running, and `agent_sandbox/settings.yaml` must use the `full-online`
+profile.
+
+From the repository root, start the built UI and webservice in one PowerShell terminal:
+
+```powershell
+$env:FLOWCEPT_SETTINGS_PATH = "$PWD\agent_sandbox\settings.yaml"
+.\.venv\Scripts\python.exe -m flowcept.cli --start --webservice
+```
+
+Keep that terminal open and visit <http://127.0.0.1:8008>. In a second PowerShell
+terminal, persist a new MAS run:
+
+```powershell
+$env:FLOWCEPT_SETTINGS_PATH = "$PWD\agent_sandbox\settings.yaml"
+.\.venv\Scripts\python.exe examples/decision_provenance_mas.py --persist --review interactive
+```
+
+Refresh the UI, open **CPD Multi-Agent Test Planning**, and select **Graphs** then
+**Provenance Graph**. Stop the webservice with `Ctrl+C`. The frontend dependencies and
+UI only need to be rebuilt after UI source changes.
+
+To replace the deterministic agents with five local foundation-model agents, install
+the LLM dependencies once and pull the local model with Ollama:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[llm_agent]"
+ollama pull qwen3:4b
+```
+
+With MongoDB, Redis, and Ollama running, execute the complete persisted MAS with:
+
+```powershell
+.\examples\run_decision_provenance_local_mas.ps1
+```
+
+The script uses `agent_sandbox/settings.yaml`, calls the local model for requirement,
+variant, test-generation, safety-criticism, and final-selection roles, and writes the
+inspectable result to `agent_sandbox/decision_provenance_mas/run.json`.
+
 ## Flowcept Agent
 
 The Flowcept Agent lets users ask natural language questions over captured provenance instead of hand-writing queries.
