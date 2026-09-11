@@ -80,7 +80,12 @@ function JsonSyntax({ value, depth = 0 }: { value: unknown; depth?: number }) {
 
 function PrettyValue({ value }: { value: unknown }) {
   if (typeof value !== "object" || value === null) {
-    return <span className="font-mono text-[11px] break-all">{String(value)}</span>;
+    const text = String(value);
+    return (
+      <span className={`font-mono text-[11px] ${text.includes("\n") ? "whitespace-pre-wrap" : "break-all"}`}>
+        {text}
+      </span>
+    );
   }
   return (
     <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded bg-surface-2 p-2 font-mono text-[11px]">
@@ -136,8 +141,65 @@ function DurationStats({ ds }: { ds: Record<string, unknown> }) {
   );
 }
 
-function GraphInspector({ kind, data }: { kind: "task" | "activity" | "dataflow"; data: GraphInspectorDoc }) {
+function DecisionInspector({ data }: { data: GraphInspectorDoc }) {
   const stats = data.stats;
+  const nodeKind = String(stats["node_kind"] ?? "");
+  const candidates = Array.isArray(stats["candidates"]) ? (stats["candidates"] as Record<string, unknown>[]) : [];
+  const assessments = Array.isArray(stats["assessments"]) ? (stats["assessments"] as Record<string, unknown>[]) : [];
+
+  return (
+    <div className="space-y-1.5">
+      <Field label={nodeKind || "node"} value={data.label} />
+      {nodeKind === "candidate" && (
+        <>
+          <Field label="status" value={stats["status"]} />
+          <Field label="rank" value={stats["rank"]} />
+          <Field label="origin_type" value={stats["origin_type"]} />
+          <Field label="content" value={stats["content"] ?? stats["content_ref"]} />
+        </>
+      )}
+      {nodeKind === "assessment" && (
+        <>
+          <Field label="why (explanation)" value={stats["explanation"]} />
+          <Field label="score" value={stats["score"]} />
+          <Field label="score_type" value={stats["score_type"]} />
+          <Field label="criteria" value={stats["criteria"]} />
+          <Field label="evaluator_id" value={stats["evaluator_id"]} />
+          <Field label="evidence_ids" value={stats["evidence_ids"]} />
+        </>
+      )}
+      {nodeKind === "decision" && (
+        <>
+          <Field label="selected" value={stats["selected_candidate_ids"]} />
+          <Field label="why (selected rationale)" value={stats["selected_rationale"]} />
+          <Field label="decision_type" value={stats["decision_type"]} />
+          <Field label="context" value={stats["context"]} />
+          <Field label="agent_id" value={stats["agent_id"]} />
+          <Field label="task_id" value={stats["task_id"]} />
+          <Field label="decision_id" value={stats["decision_id"]} />
+          {candidates.length > 0 && (
+            <Field
+              label={`alternatives considered (${candidates.length})`}
+              value={candidates.map((c) => `${c.status === "selected" ? "✓" : "✗"} ${c.candidate_id}`).join("\n")}
+            />
+          )}
+          {assessments.length > 0 && (
+            <Field
+              label={`assessments (${assessments.length})`}
+              value={assessments.map((a) => `${a.candidate_id}: ${a.score ?? "—"} — ${a.explanation ?? ""}`).join("\n")}
+            />
+          )}
+        </>
+      )}
+      {(nodeKind === "evidence" || nodeKind === "output") && <Field label="entity_id" value={stats["entity_id"]} />}
+      {nodeKind === "agent" && <Field label="agent_id" value={stats["agent_id"]} />}
+    </div>
+  );
+}
+
+function GraphInspector({ kind, data }: { kind: "task" | "activity" | "dataflow" | "decision"; data: GraphInspectorDoc }) {
+  const stats = data.stats;
+  if (kind === "decision") return <DecisionInspector data={data} />;
   if (kind === "task") {
     const start = toEpochSec(stats["started_at"] as Parameters<typeof toEpochSec>[0]);
     const end = toEpochSec(stats["ended_at"] as Parameters<typeof toEpochSec>[0]);
@@ -381,6 +443,8 @@ function AppShell() {
                 ? "Activity"
                 : inspectorEntity.kind === "chart"
                 ? inspectorEntity.title
+                : inspectorEntity.kind === "decision"
+                ? "Decision Provenance"
                 : "Provenance"}
             </div>
             {inspectorEntity.kind === "object" && (

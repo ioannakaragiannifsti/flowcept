@@ -10,7 +10,7 @@ export interface GraphInspectorDoc extends Record<string, unknown> {
 
 export type InspectorEntity =
   | { kind: "object"; data: BlobObjectDoc }
-  | { kind: "task" | "activity" | "dataflow"; data: GraphInspectorDoc }
+  | { kind: "task" | "activity" | "dataflow" | "decision"; data: GraphInspectorDoc }
   | { kind: "chart"; title: string; rows: Record<string, unknown>[] }
   | null;
 

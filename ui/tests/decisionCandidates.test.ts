@@ -44,9 +44,17 @@ describe("buildDecisionCandidates", () => {
 
     expect(trace.decisions).toHaveLength(1);
     expect(trace.nodes.find((node) => node.kind === "decision")?.label).toBe("selection");
-    expect(trace.nodes.find((node) => node.kind === "candidate" && node.selected)?.label).toBe(
-      "Rollback the release",
-    );
+    const selectedCandidate = trace.nodes.find((node) => node.kind === "candidate" && node.selected);
+    // The label is the stable candidate id; the payload becomes a readable sublabel.
+    expect(selectedCandidate?.label).toBe("rollback");
+    expect(selectedCandidate?.sublabel).toBe("Rollback the release");
+    expect(selectedCandidate?.score).toBe(0.9);
+
+    // The winning assessment's explanation is surfaced on the decision node.
+    const decisionNode = trace.nodes.find((node) => node.kind === "decision");
+    expect(decisionNode?.sublabel).toBe("Rollback is reversible.");
+    expect(decisionNode?.details.selected_rationale).toBe("Rollback is reversible.");
+    expect(decisionNode?.details.selected_candidate_ids).toEqual(["rollback"]);
     expect(trace.edges).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ relation: "made", source: "agent:judge-agent" }),

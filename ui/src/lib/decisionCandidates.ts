@@ -16,6 +16,10 @@ export interface DecisionCandidateNode {
   id: string;
   kind: DecisionCandidateNodeKind;
   label: string;
+  /** Short human-readable descriptor shown under the label. */
+  sublabel?: string;
+  /** Headline score shown on the node, when one was assessed. */
+  score?: number;
   selected?: boolean;
   details: Record<string, unknown>;
 }
@@ -48,6 +52,20 @@ function labelValue(value: unknown, fallback: string): string {
   if (typeof value === "string" && value) return value;
   if (value !== undefined && value !== null) return JSON.stringify(value);
   return fallback;
+}
+
+/** Short descriptive fields a domain may use to name an alternative. */
+const SUMMARY_FIELDS = ["strategy", "summary", "title", "name", "label", "description", "test_id"];
+
+/** Pick a short readable descriptor out of an arbitrary candidate payload. */
+function summarize(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  const record = asRecord(content);
+  for (const field of SUMMARY_FIELDS) {
+    const value = record[field];
+    if (typeof value === "string" && value) return value;
+  }
+  return undefined;
 }
 
 /** Convert captured decision tasks into a UI-ready evidence-to-decision trace. */
@@ -106,7 +124,8 @@ export function buildDecisionCandidates(tasks: Task[]): DecisionCandidates {
       addNode({
         id: candidateId,
         kind: "candidate",
-        label: labelValue(candidate.content ?? candidate.content_ref, rawCandidateId),
+        label: rawCandidateId,
+        sublabel: summarize(candidate.content ?? candidate.content_ref),
         selected,
         details: candidate,
       });
@@ -150,6 +169,29 @@ export function buildDecisionCandidates(tasks: Task[]): DecisionCandidates {
         addEdge({ source: evidenceId, target: assessmentId, relation: "supports" });
       }
     });
+
+    // Surface each candidate's headline score on its node, and the winning rationale on the decision.
+    for (const assessment of asRecords(decision.assessments)) {
+      const rawCandidateId = labelValue(assessment.candidate_id, "candidate");
+      const candidateNode = nodes.get(candidateIds.get(rawCandidateId) ?? "");
+      if (!candidateNode) continue;
+      if (candidateNode.score === undefined && typeof assessment.score === "number") {
+        candidateNode.score = assessment.score;
+      }
+      if (typeof assessment.explanation === "string" && assessment.explanation) {
+        if (!candidateNode.sublabel) candidateNode.sublabel = assessment.explanation;
+        if (selectedIds.has(rawCandidateId)) {
+          const decisionNode = nodes.get(decisionId);
+          if (decisionNode) {
+            decisionNode.sublabel ??= assessment.explanation;
+            decisionNode.details.selected_rationale = assessment.explanation;
+          }
+        }
+      }
+    }
+
+    const decisionNode = nodes.get(decisionId);
+    if (decisionNode) decisionNode.details.selected_candidate_ids = decision.selected_candidate_ids;
 
     const outputs = new Set([
       ...asStrings(generated.output_entity_ids),

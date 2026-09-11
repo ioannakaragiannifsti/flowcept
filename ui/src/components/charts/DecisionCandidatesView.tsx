@@ -51,9 +51,19 @@ function nodeLabel(node: DecisionCandidateNode) {
   return (
     <div className="max-w-48 text-center">
       <div className="text-[9px] font-semibold uppercase tracking-wide opacity-65">{node.kind}</div>
-      <div className="line-clamp-3 text-[11px] font-medium">{node.label}</div>
-      {node.kind === "candidate" && node.selected && (
-        <div className="mt-1 text-[9px] font-bold uppercase text-green-800">selected</div>
+      <div className="line-clamp-2 text-[11px] font-semibold">{node.label}</div>
+      {node.sublabel && (
+        <div className="line-clamp-2 text-[9px] leading-snug opacity-75">{node.sublabel}</div>
+      )}
+      {node.score !== undefined && (
+        <div className="mt-0.5 text-[9px] font-mono font-semibold">score {node.score}</div>
+      )}
+      {node.kind === "candidate" && (
+        <div
+          className={`mt-1 text-[9px] font-bold uppercase ${node.selected ? "text-green-800" : "text-red-800"}`}
+        >
+          {node.selected ? "selected" : "not selected"}
+        </div>
       )}
     </div>
   );
@@ -137,8 +147,8 @@ export function DecisionCandidatesView({ tasks, height }: Props) {
             onNodeClick={(_, graphNode) => {
               const traceNode = graphNode.data.traceNode as DecisionCandidateNode;
               useInspectorStore.getState().set({
-                kind: "dataflow",
-                data: { label: traceNode.label, stats: traceNode.details },
+                kind: "decision",
+                data: { label: traceNode.label, stats: { ...traceNode.details, node_kind: traceNode.kind } },
               });
             }}
           >
