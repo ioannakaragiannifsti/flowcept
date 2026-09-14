@@ -204,21 +204,34 @@ def _find_message_sources(tasks: list[dict], evidence: dict, response_field: str
     return sources
 
 
+# Captured decoding parameters that belong in model_kwargs rather than as constructor
+# arguments. response_format is the consequential one: replaying a judge without the
+# structured-output constraint it originally ran under lets it reason freely and reach a
+# different outcome, which shows up as a baseline that never reproduces.
+MODEL_KWARG_PARAMETERS = ("response_format",)
+
+
+def build_judge_model(model_name: str, model_parameters: dict) -> ChatOpenAI:
+    """Rebuild the judge using the decoding configuration it was originally captured with."""
+    parameters = dict(model_parameters or {})
+    model_kwargs = {name: parameters.pop(name) for name in MODEL_KWARG_PARAMETERS if name in parameters}
+    return ChatOpenAI(
+        api_key=AGENT_API_KEY,
+        base_url=AGENT["llm_server_url"],
+        model=model_name,
+        **parameters,
+        **({"model_kwargs": model_kwargs} if model_kwargs else {}),
+    )
+
+
 def _invoke_judge(
     system_text: str,
     user_text: str,
     model_name: str,
-    max_tokens: int,
+    model_parameters: dict,
 ) -> str:
     """Re-run the judge on a prompt that is the captured one, edited only where intended."""
-    model = ChatOpenAI(
-        api_key=AGENT_API_KEY,
-        base_url=AGENT["llm_server_url"],
-        model=model_name,
-        temperature=0,
-        reasoning_effort="none",
-        max_tokens=max_tokens,
-    )
+    model = build_judge_model(model_name, model_parameters)
     response = model.invoke(
         [
             {"role": "system", "content": system_text},
@@ -279,8 +292,8 @@ def analyze_workflow(
     rendering_name, render_evidence = find_evidence_rendering(user_text, evidence)
     metadata = judge_invocation.get("custom_metadata") or {}
     model_name = metadata.get("model_name") or AGENT["model"]
-    max_tokens = (metadata.get("model_parameters") or {}).get("max_tokens", 350)
-    reproduced_baselines = [_invoke_judge(system_text, user_text, model_name, max_tokens) for _ in range(trials)]
+    model_parameters = metadata.get("model_parameters") or {"max_tokens": 350}
+    reproduced_baselines = [_invoke_judge(system_text, user_text, model_name, model_parameters) for _ in range(trials)]
 
     counterfactuals = []
     causal_edges = []
@@ -296,7 +309,7 @@ def analyze_workflow(
                     system_text,
                     apply_evidence(user_text, evidence, reduced_evidence, render_evidence),
                     model_name,
-                    max_tokens,
+                    model_parameters,
                 )
                 jobs.append((future, trial_index, reproduced_baseline, evidence_key, source))
 
@@ -352,6 +365,9 @@ def analyze_workflow(
         "available_intervention_count": len(sources),
         "method": "repeated direct judge-input message removal with fixed model parameters",
         "intervention_mechanism": (f"in-place edit of the captured prompt; evidence located as {rendering_name}"),
+        # Recorded so a reader can confirm the replayed judge was decoded the same way as the
+        # captured one. A baseline that fails to reproduce usually shows up here first.
+        "replayed_model_parameters": model_parameters,
         "limitations": [
             "This estimates the direct effect of each observed message on the judge, conditional on other messages.",
             "It does not expose hidden chain-of-thought or estimate indirect effects through downstream agents.",

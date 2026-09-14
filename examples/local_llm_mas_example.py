@@ -4,18 +4,22 @@ Every agent must enumerate the alternatives it considered, assess each one, and
 select exactly one. Each of those choices is captured as its own Flowcept
 decision record, so the UI and the post-hoc analyzers can show not only what each
 agent answered but which options it weighed and why it rejected the others.
+
+Each agent delegates its model call to ``DecisionCapture.invoke``, which builds the
+prompt from the decision context, enforces the ``DecisionResponse`` contract, and records
+both the invocation and the decision. The narrative an agent passes downstream is derived
+from the recorded decision rather than asked for separately, so a visible answer can never
+contradict the decision it is supposed to describe.
 """
 
 import argparse
 import json
-import re
 
 from langchain_openai import ChatOpenAI
 
 from flowcept import DecisionCapture, Flowcept, FlowceptTask
 from flowcept.commons.vocabulary import PROV_AGENT
 from flowcept.configs import AGENT, AGENT_API_KEY
-from flowcept.instrumentation.flowcept_agent_task import FlowceptLLM
 
 INCIDENT = (
     "At 09:10, customers began reporting that the online checkout accepts orders but "
@@ -32,177 +36,103 @@ COMMANDER_CANDIDATES = ("execute", "modify", "reject")
 # Too low and the object is truncated mid-string, which reads as invalid JSON.
 MAX_TOKENS = 1600
 
-DECISION_SCHEMA = {
-    "candidates": [
-        {
-            "candidate_id": "short_snake_case_id",
-            "summary": "one line naming the alternative",
-            "rationale": "why this alternative is plausible",
-        }
-    ],
-    "assessments": [
-        {
-            "candidate_id": "short_snake_case_id",
-            "score": "number between 0 and 1",
-            "explanation": "why this alternative scored this way, citing the evidence",
-        }
-    ],
-    "selected_candidate_id": "short_snake_case_id",
-    "answer": "the narrative response to the task",
-}
 
+def _decision_context(agent_role: str, question: str, model_name: str, fixed: tuple[str, ...] | None) -> dict:
+    """Build the decision context DecisionCapture turns into the model's system prompt.
 
-def _slug(value: object, fallback: str) -> str:
-    """Normalize an arbitrary model-supplied identifier into a stable candidate id."""
-    text = str(value).strip().lower() if value is not None else ""
-    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
-    return text or fallback
-
-
-def _build_prompt(agent_role: str, instruction: str, evidence: dict, question: str, fixed: tuple[str, ...] | None):
-    """Build a role prompt that requires explicit alternatives, assessments, and one selection."""
+    ``DecisionCapture.invoke`` owns the prompt, so everything role-specific this MAS needs
+    the model to honour has to travel inside the context it serializes.
+    """
+    context = {
+        "question": question,
+        "agent_role": f"the {agent_role} in a production incident-response team",
+        "model": model_name,
+        "instructions": [
+            "Use only the supplied evidence and state uncertainties.",
+            "Put a one-line description of each alternative in the candidate's content field.",
+            "Keep every explanation to one short sentence.",
+        ],
+    }
     if fixed:
-        candidate_rule = (
-            f"You MUST return exactly these {len(fixed)} candidates, with candidate_id values "
-            f"{list(fixed)} and nothing else, and assess every one of them."
+        context["required_candidate_ids"] = list(fixed)
+        context["instructions"].append(
+            f"Return exactly the candidates {list(fixed)} and nothing else, and assess every one of them."
         )
     else:
-        candidate_rule = (
-            "You MUST return at least two genuinely different candidates and assess every one of them. "
-            "Never return a single candidate."
+        context["instructions"].append(
+            "Return at least two genuinely different candidates and assess every one of them."
         )
-    return [
-        {
-            "role": "system",
-            "content": (
-                f"You are the {agent_role} in a production incident-response team. "
-                "You do not answer questions directly. You make a decision among explicit alternatives "
-                "and report that decision as JSON.\n\n"
-                "Your entire reply MUST be one JSON object with EXACTLY these four top-level keys and no "
-                'others: "candidates", "assessments", "selected_candidate_id", "answer". '
-                "Do not add top-level keys of your own, and do not describe the incident at the top level. "
-                'Your prose belongs inside the "answer" string.\n\n'
-                f"{candidate_rule}\n\n"
-                'Use only the supplied evidence, state uncertainties, keep "answer" under 180 words, and give '
-                "concise decision reasons rather than hidden chain-of-thought. "
-                'Keep every "rationale" and "explanation" to one short sentence so the JSON stays complete.'
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"DECISION TO MAKE:\n{question}\n\n"
-                f"REQUIRED JSON SHAPE (copy these key names exactly):\n{json.dumps(DECISION_SCHEMA, indent=2)}\n\n"
-                f"EVIDENCE:\n{json.dumps(evidence, indent=2, default=str)}\n\n"
-                f'What the "answer" field must contain:\n{instruction}\n\n'
-                'Reply now with the JSON object whose top-level keys are exactly "candidates", '
-                '"assessments", "selected_candidate_id", and "answer".'
-            ),
-        },
-    ]
+    return context
 
 
-def _repair_message(error: str, fixed: tuple[str, ...] | None) -> dict:
-    """Build a corrective turn asking the model to restate its choice in the required shape."""
-    allowed = f" The candidate_id values must be exactly {list(fixed)}." if fixed else ""
-    return {
-        "role": "user",
-        "content": (
-            f"That reply was rejected: {error}\n\n"
-            'Reply again with ONLY a JSON object whose top-level keys are exactly "candidates", '
-            '"assessments", "selected_candidate_id", and "answer". "candidates" must be a JSON array of '
-            'objects, each with "candidate_id", "summary", and "rationale". "assessments" must be a JSON '
-            'array of objects, each with "candidate_id", "score", and "explanation". '
-            '"selected_candidate_id" must equal one of the candidate_id values you listed.' + allowed
-        ),
-    }
+def _decision_request(instruction: str, evidence: dict, complaint: str | None = None) -> str:
+    """Build the user message for one decision, optionally restating a rejected attempt."""
+    request = f"{instruction}\n\nEVIDENCE:\n{json.dumps(evidence, indent=2, default=str)}"
+    if complaint:
+        request = f"{request}\n\nA previous attempt was rejected: {complaint}\nSatisfy that requirement this time."
+    return request
 
 
-def _parse_decision_payload(response: str, agent_id: str, fixed: tuple[str, ...] | None) -> dict:
-    """Parse and normalize a model decision payload, tolerating small-model quirks."""
-    try:
-        parsed = json.loads(response)
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{agent_id} did not return valid JSON: {error}") from error
-    if not isinstance(parsed, dict):
-        raise TypeError(f"{agent_id} returned {type(parsed).__name__}, expected a JSON object")
+def _describe(content) -> str:
+    """Render a candidate's content as one readable line."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, dict):
+        for field in ("summary", "description", "title", "name", "strategy"):
+            value = content.get(field)
+            if isinstance(value, str) and value:
+                return value.strip()
+    return json.dumps(content, default=str)
 
-    # Small models sometimes emit a single candidate object instead of a list.
-    raw_candidates = parsed.get("candidates")
-    if isinstance(raw_candidates, dict):
-        raw_candidates = [raw_candidates]
-    elif not isinstance(raw_candidates, list):
-        raw_candidates = []
 
-    candidates = []
-    seen = set()
-    for index, item in enumerate(raw_candidates, start=1):
-        if not isinstance(item, dict):
-            item = {"summary": str(item)}
-        candidate_id = _slug(item.get("candidate_id") or item.get("id") or item.get("summary"), f"candidate_{index}")
-        if candidate_id in seen:
-            continue
-        seen.add(candidate_id)
-        candidates.append({**item, "candidate_id": candidate_id})
+def _check_record(record, agent_id: str, fixed: tuple[str, ...] | None) -> None:
+    """Apply this MAS's requirements on top of the contract DecisionCapture already enforced.
 
+    These run after ``invoke`` has already published the decision task, so a rejection here
+    reports a decision that is present in provenance. That is the cost of letting
+    DecisionCapture own the model call; manual capture could validate before recording.
+    """
+    returned = {candidate.candidate_id for candidate in record.candidates}
     if fixed:
-        # Keep only the agreed vocabulary, and add back any option the model omitted so the
-        # rejected alternatives are still recorded rather than silently disappearing.
-        by_id = {candidate["candidate_id"]: candidate for candidate in candidates if candidate["candidate_id"] in fixed}
-        candidates = [
-            by_id.get(option, {"candidate_id": option, "summary": option, "rationale": "not elaborated by the agent"})
-            for option in fixed
-        ]
+        missing = [option for option in fixed if option not in returned]
+        unexpected = sorted(returned - set(fixed))
+        if missing or unexpected:
+            raise ValueError(
+                f"{agent_id} must return exactly the candidates {list(fixed)}; "
+                f"missing={missing} unexpected={unexpected}"
+            )
+    elif len(returned) < 2:
+        raise ValueError(f"{agent_id} returned {len(returned)} candidate(s); at least 2 are required")
 
-    if len(candidates) < 2:
-        raise ValueError(f"{agent_id} returned {len(candidates)} candidate(s); at least 2 are required")
-
-    known = {candidate["candidate_id"] for candidate in candidates}
-
-    raw_assessments = parsed.get("assessments")
-    if isinstance(raw_assessments, dict):
-        raw_assessments = [raw_assessments]
-    elif not isinstance(raw_assessments, list):
-        raw_assessments = []
-
-    assessments = []
-    for item in raw_assessments:
-        if not isinstance(item, dict):
-            continue
-        candidate_id = _slug(item.get("candidate_id") or item.get("id"), "")
-        if candidate_id not in known:
-            continue  # An assessment of an unknown candidate would be rejected by DecisionRecord.
-        try:
-            score = float(item["score"]) if item.get("score") is not None else None
-        except (TypeError, ValueError):
-            score = None
-        assessments.append(
-            {
-                "candidate_id": candidate_id,
-                "score": score,
-                "explanation": str(item.get("explanation") or "").strip() or None,
-            }
-        )
-
-    selected = _slug(parsed.get("selected_candidate_id") or parsed.get("selected") or parsed.get("decision"), "")
-    if selected not in known:
+    if len(record.selected_candidate_ids) != 1:
         raise ValueError(
-            f"{agent_id} selected {selected!r}, which is not one of the candidates it proposed: {sorted(known)}"
+            f"{agent_id} selected {len(record.selected_candidate_ids)} candidates; this MAS requires exactly one"
         )
 
-    answer = str(parsed.get("answer") or "").strip()
-    if not answer:
-        answer = next(
-            (str(c.get("summary") or c["candidate_id"]) for c in candidates if c["candidate_id"] == selected),
-            selected,
-        )
+
+def _derive_answer(record, fixed: tuple[str, ...] | None) -> str:
+    """Build the narrative passed downstream directly from the recorded decision.
+
+    Deriving it means the visible answer cannot disagree with the recorded decision, and
+    it keeps the explicit outcome label the causal analyzer depends on.
+    """
+    selected = record.selected_candidate_ids[0]
+    chosen = next(candidate for candidate in record.candidates if candidate.candidate_id == selected)
+    assessment = next(item for item in record.assessments if item.candidate_id == selected)
+    rejected = [
+        f"{item.candidate_id} ({item.score:g}): {item.explanation}"
+        for item in record.assessments
+        if item.candidate_id != selected
+    ]
+    lines = []
     if fixed:
-        # The causal analyzer keys on this explicit outcome label in the visible answer.
-        label = f"DECISION: {selected.upper()}"
-        if not answer.upper().startswith("DECISION:"):
-            answer = f"{label}\n{answer}"
-
-    return {"candidates": candidates, "assessments": assessments, "selected": selected, "answer": answer}
+        # The analyzer reads this label to decide whether an intervention changed the outcome.
+        lines.append(f"DECISION: {selected.upper()}")
+    lines.append(f"{_describe(chosen.content)} (confidence {assessment.score:g})")
+    lines.append(assessment.explanation)
+    if rejected:
+        lines.append("Rejected alternatives: " + "; ".join(rejected))
+    return "\n".join(lines)
 
 
 def run_agent(
@@ -232,6 +162,11 @@ def run_agent(
         },
         capture_telemetry=False,
     ) as agent_task:
+        # reasoning_effort="none" matters: qwen3 and other reasoning models otherwise emit a
+        # long <think> deliberation before answering, which costs minutes per call and can
+        # change the outcome. DecisionCapture.invoke wraps this model itself, so these
+        # settings are NOT recorded as custom_metadata.model_parameters the way manual
+        # capture recorded them, and the causal analyzer cannot read them back.
         model = ChatOpenAI(
             api_key=AGENT_API_KEY,
             base_url=AGENT["llm_server_url"],
@@ -239,88 +174,47 @@ def run_agent(
             temperature=0,
             reasoning_effort="none",
             max_tokens=MAX_TOKENS,
-            model_kwargs={"response_format": {"type": "json_object"}},
         )
-        llm = FlowceptLLM(
-            model,
-            agent_id=agent_id,
-            parent_task_id=agent_task.get_id(),
-            workflow_id=workflow_id,
-        )
-        llm.metadata.update(
-            {
-                "provider": "ollama",
-                "model_name": model_name,
-                "model_parameters": {
-                    "temperature": 0,
-                    "reasoning_effort": "none",
-                    "max_tokens": MAX_TOKENS,
-                    "response_format": {"type": "json_object"},
-                },
-                "agent_role": agent_role,
-            }
-        )
-        prompt = _build_prompt(agent_role, instruction, evidence, decision_question, fixed_candidates)
-        raw_response = llm.invoke(prompt)
-        try:
-            payload = _parse_decision_payload(raw_response, agent_id, fixed_candidates)
-        except (ValueError, TypeError) as error:
-            # Small models often miss the shape on the first pass. Ask once more with the
-            # specific complaint; the repair call is captured too, so the retry stays visible.
-            repair_prompt = [
-                *prompt,
-                {"role": "assistant", "content": raw_response},
-                _repair_message(str(error), fixed_candidates),
-            ]
-            raw_response = llm.invoke(repair_prompt)
-            payload = _parse_decision_payload(raw_response, agent_id, fixed_candidates)
-        answer = payload["answer"]
+        context = _decision_context(agent_role, decision_question, model_name, fixed_candidates)
+
+        # DecisionCapture drives the model, builds the prompt from the context above, and
+        # records the invocation and the decision itself. A capture holds one decision, so a
+        # rejected attempt needs a fresh one.
+        record = None
+        complaint = None
+        for attempt in range(2):
+            capture = DecisionCapture(
+                decision_type=decision_type,
+                context=context,
+                agent_id=agent_id,
+                workflow_id=workflow_id,
+                parent_task_id=agent_task.get_id(),
+                input_entity_ids=input_entity_ids,
+                output_entity_ids=[output_entity_id],
+                llm=model,
+            )
+            record = capture.invoke(_decision_request(instruction, evidence, complaint))
+            try:
+                _check_record(record, agent_id, fixed_candidates)
+                break
+            except ValueError as error:
+                if attempt == 1:
+                    raise
+                complaint = str(error)
+
+        selected = record.selected_candidate_ids[0]
+        answer = _derive_answer(record, fixed_candidates)
 
         agent_task.end(
             generated={
                 # `response` stays the visible narrative so the causal analyzer contract holds.
                 "response": answer,
-                "candidates": payload["candidates"],
-                "selected_candidate_id": payload["selected"],
+                "candidates": [candidate.to_dict() for candidate in record.candidates],
+                "selected_candidate_id": selected,
                 "output_entity_ids": [output_entity_id],
             }
         )
-    agent_task_id = agent_task.get_id()
-
-    with DecisionCapture(
-        decision_type=decision_type,
-        context={
-            "question": decision_question,
-            "agent_role": agent_role,
-            "instruction": instruction,
-            "model": model_name,
-        },
-        agent_id=agent_id,
-        workflow_id=workflow_id,
-        parent_task_id=agent_task_id,
-        input_entity_ids=input_entity_ids,
-        output_entity_ids=[output_entity_id],
-    ) as decision:
-        for rank, candidate in enumerate(payload["candidates"], start=1):
-            decision.add_candidate(
-                candidate["candidate_id"],
-                content=candidate,
-                origin_type="model_generation",
-                rank=rank,
-            )
-        for assessment in payload["assessments"]:
-            decision.assess(
-                assessment["candidate_id"],
-                evaluator_id=agent_id,
-                score_type="model_self_assessment",
-                score=assessment["score"],
-                explanation=assessment["explanation"],
-                criteria=["evidence support", "operational risk", "reversibility"],
-                evidence_ids=input_entity_ids,
-            )
-        decision.select(payload["selected"])
-
-    return answer, agent_task_id
+    return answer, agent_task.get_id()
 
 
 def run_simulation(model_name: str = "qwen3:4b") -> tuple[str, str]:

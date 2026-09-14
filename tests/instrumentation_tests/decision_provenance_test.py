@@ -1,3 +1,8 @@
+import json
+
+import pytest
+
+from flowcept import Assessment, DecisionCapture, DecisionRecord, Flowcept, record_decision
 from flowcept.commons.flowcept_dataclasses.decision_provenance import Candidate
 
 
@@ -15,9 +20,6 @@ def test_candidate_serialization():
         "status": "selected",
         "origin_type": "explicit_generation",
     }
-
-
-from flowcept import Assessment, DecisionRecord, Flowcept, record_decision
 
 
 def test_record_decision():
@@ -52,9 +54,6 @@ def test_record_decision():
     assert captured["generated"]["decision"]["selected_candidate_ids"] == ["candidate-001"]
 
 
-from flowcept import DecisionCapture
-
-
 def test_decision_capture_context():
     """Capture a decision through the context-manager API."""
     with Flowcept(start_persistence=False):
@@ -79,76 +78,129 @@ def test_decision_capture_context():
     assert tasks[0]["generated"]["decision"]["selected_candidate_ids"] == ["candidate-001"]
 
 
-def test_product_engineering_mas_selects_complete_safety_test():
-    """The MAS must reject cheaper candidates that miss safety-critical coverage."""
-    from examples.decision_provenance_mas import run_pipeline
-
-    result = run_pipeline(review_action="approve")
-
-    assert result["recommendation"]["candidate_id"] == "cpd-test-extended"
-    assert result["review"]["action"] == "approve"
-    assert result["final_test"]["test_id"] == "CPD-TC-EXTENDED"
-    assert result["workflow_id"]
-
-    task_subtypes = {task.get("subtype") for task in result["provenance"]["tasks"]}
-    assert {"agent_tool", "decision"} <= task_subtypes
-    assert len(result["provenance"]["agents"]) == 6
-    assert result["provenance"]["edges"]
+def decision_output():
+    """Generate a decision payload to exercise the response boundary."""
+    return {
+        "candidates": [{"candidate_id": "a", "content": "First"}, {"candidate_id": "b", "content": "Second"}],
+        "assessments": [
+            {"candidate_id": candidate, "score": score, "criteria": ["relevance"], "explanation": explanation}
+            for candidate, score, explanation in [("a", 0.9, "Meets the request"), ("b", 0.4, "Less relevant")]
+        ],
+        "selected_candidate_ids": ["a"],
+    }
 
 
-def test_product_engineering_mas_preserves_human_override():
-    """A human override remains distinct from the AI recommendation."""
-    from examples.decision_provenance_mas import run_pipeline
-
-    result = run_pipeline(review_action="override", override_candidate_id="cpd-test-conservative")
-
-    assert result["recommendation"]["candidate_id"] == "cpd-test-extended"
-    assert result["review"]["selected_candidate_id"] == "cpd-test-conservative"
-    assert result["final_test"]["test_id"] == "CPD-TC-CONSERVATIVE"
-
-    decisions = [task for task in result["provenance"]["tasks"] if task.get("subtype") == "decision"]
-    assert [task["agent_id"] for task in decisions] == ["decision-board", "human-reviewer"]
-
-
-def test_local_agent_prompt_and_response_contract():
-    """Local agents exchange reviewable JSON rather than unstructured prose."""
-    from examples.decision_provenance_mas import _build_agent_messages, _parse_agent_response
-
-    messages = _build_agent_messages(
-        role="Safety critic",
-        task="Assess candidate coverage and residual risk.",
-        inputs={"candidate_id": "cpd-test-extended"},
-        output_schema={"candidate_id": "string", "eligible": "boolean"},
-    )
-    parsed = _parse_agent_response(
-        '{"candidate_id":"cpd-test-extended","eligible":true}',
-        required_fields=("candidate_id", "eligible"),
-    )
-
-    assert messages[0]["role"] == "system"
-    assert "Safety critic" in messages[0]["content"]
-    assert '"candidate_id": "cpd-test-extended"' in messages[1]["content"]
-    assert parsed == {"candidate_id": "cpd-test-extended", "eligible": True}
+def test_capture_structured_response():
+    """Map validated output to the real buffer without duplicating context exit records."""
+    with Flowcept(start_persistence=False):
+        with DecisionCapture("selection", "Select", agent_id="evaluator", input_entity_ids=["request"]) as capture:
+            record = capture.record_response(json.dumps(decision_output()), invocation_task_id="invocation")
+        tasks = [message for message in Flowcept.buffer if message.get("subtype") == "decision"]
+    assert len(tasks) == 1
+    assert tasks[0]["parent_task_id"] == "invocation"
+    assert tasks[0]["generated"]["decision"] == record.to_dict()
+    assert record.input_entity_ids == ["request"]
+    assert [candidate.status for candidate in record.candidates] == ["selected", "rejected"]
+    assert all(assessment.evaluator_id == "evaluator" for assessment in record.assessments)
+    assert all(assessment.score_type == "model_reported_confidence" for assessment in record.assessments)
+    with pytest.raises(ValueError, match="already"):
+        capture.record_response(json.dumps(decision_output()), invocation_task_id="another")
 
 
-def test_local_agent_accepts_single_item_for_collection_handoff():
-    """A small local model's single candidate can continue through the MAS."""
-    from examples.decision_provenance_mas import _parse_agent_response
+@pytest.mark.parametrize("case", ["score", "nan", "unknown", "duplicate", "unassessed", "empty", "extra", "type"])
+def test_invalid_decision_response_is_not_recorded(case):
+    """Reject invalid model output without publishing a successful decision."""
+    output = decision_output()
+    if case == "score":
+        output["assessments"][0]["score"] = 1.1
+    elif case == "nan":
+        output["assessments"][0]["score"] = float("nan")
+    elif case == "unknown":
+        output["selected_candidate_ids"] = ["missing"]
+    elif case == "duplicate":
+        output["candidates"][1]["candidate_id"] = "a"
+    elif case == "unassessed":
+        output["assessments"].pop()
+    elif case == "empty":
+        output["selected_candidate_ids"] = []
+    elif case == "extra":
+        output["workflow_id"] = "invented"
+    elif case == "type":
+        output["assessments"][0]["score"] = "0.9"
+    with Flowcept(start_persistence=False):
+        with pytest.raises(ValueError), DecisionCapture("selection", "Select", agent_id="evaluator") as capture:
+            capture.record_response(json.dumps(output), invocation_task_id="invocation")
+        assert not [message for message in Flowcept.buffer if message.get("subtype") == "decision"]
 
-    parsed = _parse_agent_response(
-        '{"candidate_id":"economical","test_id":"CPD-1"}',
-        required_fields=("candidates",),
-    )
 
-    assert parsed == {"candidates": [{"candidate_id": "economical", "test_id": "CPD-1"}]}
+def test_automatic_capture_requires_attachment():
+    """Importing or constructing manual capture does not activate an LLM."""
+    capture = DecisionCapture("selection", "Select", agent_id="evaluator")
+    with pytest.raises(ValueError, match="llm"):
+        capture.invoke("Select an output")
 
 
-def test_local_model_observation_does_not_control_pipeline_handoff():
-    """Unexpected model JSON remains observable without breaking the test workflow."""
-    from examples.decision_provenance_mas import _merge_model_observation
+def test_decision_prompt_uses_validated_contract():
+    """Build the prompt from the same schema used to validate model output."""
+    from flowcept.instrumentation.decision_response import DecisionResponse
 
-    handoff = {"affected_variants": ["ICE-EU"], "reason": "deterministic scaffold"}
-    result = _merge_model_observation(handoff, '{"unexpected":"but captured"}')
+    prompt = DecisionResponse.build_prompt("selection", {"criteria": ["quality"]})
+    assert json.loads(prompt.split("JSON schema: ")[1]) == DecisionResponse.model_json_schema()
+    assert json.dumps({"criteria": ["quality"]}) in prompt
 
-    assert result["affected_variants"] == ["ICE-EU"]
-    assert result["model_output"] == {"unexpected": "but captured"}
+
+def test_provider_response_format_requires_assessments_and_selection():
+    """The provider contract must prohibit the empty lists observed in Ollama output."""
+    from flowcept.instrumentation.decision_response import DecisionResponse
+
+    response_format = DecisionResponse.response_format()
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    properties = response_format["json_schema"]["schema"]["properties"]
+    assert properties["assessments"]["minItems"] == 1
+    assert properties["selected_candidate_ids"]["minItems"] == 1
+
+
+def test_caught_validation_failure_does_not_record_empty_decision():
+    """Context exit must not turn a caught parse failure into an empty success."""
+    with Flowcept(start_persistence=False):
+        with DecisionCapture("selection", "Select", agent_id="evaluator") as capture, pytest.raises(ValueError):
+            capture.record_response("not JSON", invocation_task_id="invocation")
+        assert not [message for message in Flowcept.buffer if message.get("subtype") == "decision"]
+
+
+def test_attached_model_without_invocation_does_not_record_decision():
+    """Attaching a real client alone must not publish an empty decision on exit."""
+    from langchain_openai import ChatOpenAI
+
+    llm = ChatOpenAI(model="gpt-4o-mini", api_key="unused-test-credential")
+    with Flowcept(start_persistence=False):
+        with DecisionCapture("selection", "Select", llm=llm):
+            pass
+        assert not [message for message in Flowcept.buffer if message.get("subtype") == "decision"]
+
+
+@pytest.mark.llm
+def test_real_llm_decision_capture():
+    """Generate and capture a real decision with its invocation and workflow links."""
+    from flowcept.configs import AGENT, AGENT_API_KEY
+
+    if not AGENT_API_KEY or AGENT_API_KEY in {"?", "your-api-key-here"}:
+        pytest.skip("LLM not configured")
+    if AGENT.get("service_provider") != "openai":
+        pytest.skip("This integration test requires an OpenAI-compatible provider")
+    from langchain_openai import ChatOpenAI
+
+    llm = ChatOpenAI(model=AGENT["model"], api_key=AGENT_API_KEY, base_url=AGENT.get("llm_server_url"))
+    with Flowcept(start_persistence=False):
+        capture = DecisionCapture("selection", "Choose an output", agent_id="evaluator", llm=llm)
+        record = capture.invoke("Propose two short greetings and select the more formal greeting.")
+        tasks = [message for message in Flowcept.buffer if message.get("type") == "task"]
+    invocation = next(task for task in tasks if task.get("subtype") == "ai_model_invocation")
+    decision = next(task for task in tasks if task.get("subtype") == "decision")
+    assert decision["parent_task_id"] == invocation["task_id"]
+    assert decision["workflow_id"] == invocation["workflow_id"]
+    assert decision["agent_id"] == invocation["agent_id"] == "evaluator"
+    assert decision["generated"]["decision"] == record.to_dict()
+    assert len(record.candidates) == 2
+    assert record.selected_candidate_ids

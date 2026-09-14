@@ -6,6 +6,7 @@ import pytest
 
 from external.causal_decision_provenance.analysis import (
     apply_evidence,
+    build_judge_model,
     build_structural_graph,
     compare_outcomes,
     extract_decision_label,
@@ -143,3 +144,23 @@ def test_unlocatable_evidence_is_an_error_rather_than_a_silent_no_op():
 
     with pytest.raises(ValueError, match="Could not locate the evidence block"):
         find_evidence_rendering(user_text, EVIDENCE)
+
+
+def test_replayed_judge_keeps_the_captured_decoding_configuration():
+    """response_format must survive the replay, or the baseline silently stops reproducing."""
+    captured = {"temperature": 0, "max_tokens": 1600, "response_format": {"type": "json_object"}}
+
+    model = build_judge_model("qwen3:4b", captured)
+
+    assert model.temperature == 0
+    assert model.max_tokens == 1600
+    # Constructor arguments and model_kwargs are separate; response_format belongs in the latter.
+    assert model.model_kwargs["response_format"] == {"type": "json_object"}
+
+
+def test_replayed_judge_without_captured_parameters_still_builds():
+    """A MAS that recorded no parameters must not crash the replay."""
+    model = build_judge_model("qwen3:4b", {})
+
+    assert model.model_name == "qwen3:4b"
+    assert not model.model_kwargs
