@@ -201,7 +201,7 @@ its reasoning, so each example must record them explicitly with `DecisionCapture
 Any new multi-agent system needs the same treatment; the UI side is generic and
 needs no per-system work.
 
-`DecisionCapture` is a **context manager, not a decorator**. It is opened around the
+`DecisionCapture` is a **context manager**. It is opened around the
 point where a choice is made, candidates and assessments are added to it, and the
 record is written when the block exits:
 
