@@ -304,6 +304,7 @@ class FlowceptLLM(Runnable):
         workflow_id=None,
         campaign_id=None,
         return_response_object: bool = False,
+        task_id: str | None = None,
     ):
         self.llm = llm
         self.agent_id = agent_id
@@ -312,12 +313,14 @@ class FlowceptLLM(Runnable):
         self.metadata = _extract_llm_metadata(llm)
         self.parent_task_id = parent_task_id
         self.return_response_object = return_response_object
+        self.task_id = task_id
 
     def _our_call(self, messages, **kwargs):
         messages_str = FlowceptLLM._format_messages(messages)
         used = {"prompt": messages_str}
         with FlowceptTask(
             used=used,
+            task_id=self.task_id,
             subtype=PROV_AGENT.AI_MODEL_INVOCATION,
             custom_metadata=self.metadata,
             agent_id=self.agent_id,
