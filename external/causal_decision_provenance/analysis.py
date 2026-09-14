@@ -71,9 +71,7 @@ def compare_outcomes(
     outcome_effect = "changed" if outcome_changed else "unchanged" if outcome_changed is False else "undetermined"
     similarity = round(SequenceMatcher(None, baseline_visible, counterfactual_visible).ratio(), 3)
     explanation_change = round(1.0 - similarity, 3)
-    explanation_sensitivity = (
-        "high" if explanation_change >= 0.5 else "medium" if explanation_change >= 0.2 else "low"
-    )
+    explanation_sensitivity = "high" if explanation_change >= 0.5 else "medium" if explanation_change >= 0.2 else "low"
     return {
         "baseline_label": baseline_label,
         "counterfactual_label": counterfactual_label,
@@ -88,6 +86,7 @@ def compare_outcomes(
 
 def summarize_trials(comparisons: list[dict]) -> dict:
     """Aggregate repeated interventions without conflating outcome and text changes."""
+
     def count_labels(field: str) -> dict[str, int]:
         counts = {}
         for item in comparisons:
@@ -127,20 +126,14 @@ def summarize_trials(comparisons: list[dict]) -> dict:
         "counterfactual_label_counts": count_labels("counterfactual_label"),
         "mean_explanation_change": mean_explanation_change,
         "explanation_sensitivity": (
-            "high"
-            if mean_explanation_change >= 0.5
-            else "medium"
-            if mean_explanation_change >= 0.2
-            else "low"
+            "high" if mean_explanation_change >= 0.5 else "medium" if mean_explanation_change >= 0.2 else "low"
         ),
     }
 
 
 def _find_judge_context(tasks: list[dict], decision_agent_id: str) -> tuple[dict, dict]:
     judge_tasks = [
-        task
-        for task in tasks
-        if task.get("subtype") == "agent_tool" and task.get("agent_id") == decision_agent_id
+        task for task in tasks if task.get("subtype") == "agent_tool" and task.get("agent_id") == decision_agent_id
     ]
     if not judge_tasks:
         raise ValueError(f"No agent_tool task found for decision agent {decision_agent_id!r}")
@@ -148,8 +141,7 @@ def _find_judge_context(tasks: list[dict], decision_agent_id: str) -> tuple[dict
     invocations = [
         task
         for task in tasks
-        if task.get("subtype") == "ai_model_invocation"
-        and task.get("parent_task_id") == judge_task["task_id"]
+        if task.get("subtype") == "ai_model_invocation" and task.get("parent_task_id") == judge_task["task_id"]
     ]
     if not invocations:
         raise ValueError(f"No ai_model_invocation found below judge task {judge_task['task_id']}")
@@ -157,9 +149,43 @@ def _find_judge_context(tasks: list[dict], decision_agent_id: str) -> tuple[dict
 
 
 def _extract_prompt_parts(formatted_prompt: str) -> tuple[str, str]:
+    """Split a captured prompt into its system text and its full user text."""
     system_text, user_text = formatted_prompt.removeprefix("System: ").split("\nUser: ", maxsplit=1)
-    instruction = user_text.split("\n\nEvidence:\n", maxsplit=1)[0]
-    return system_text, instruction
+    return system_text, user_text
+
+
+# Ways a MAS may have serialized its evidence mapping into the prompt. The analyzer
+# finds whichever one actually appears so it can edit the prompt in place instead of
+# rebuilding it in a format the agent never used.
+EVIDENCE_RENDERERS = (
+    ("json_indent_2", lambda evidence: json.dumps(evidence, indent=2, default=str)),
+    ("json_compact", lambda evidence: json.dumps(evidence, default=str)),
+    ("python_repr", str),
+)
+
+
+def find_evidence_rendering(user_text: str, evidence: dict):
+    """Return the renderer whose output for this evidence appears verbatim in the prompt.
+
+    Editing the captured prompt in place is what makes an intervention faithful: the
+    counterfactual differs from the original by exactly the removed message and nothing
+    else. Rebuilding the prompt from a guessed template silently changes the judge's
+    input, so a reconstruction that cannot be located is an error rather than a fallback.
+    """
+    for name, render in EVIDENCE_RENDERERS:
+        if render(evidence) in user_text:
+            return name, render
+    raise ValueError(
+        "Could not locate the evidence block inside the captured prompt. The analyzer "
+        "only intervenes on prompts it can edit verbatim; rebuilding the prompt would "
+        "change the judge's input beyond the intended removal. Checked renderings: "
+        + ", ".join(name for name, _ in EVIDENCE_RENDERERS)
+    )
+
+
+def apply_evidence(user_text: str, evidence: dict, reduced_evidence: dict, render) -> str:
+    """Replace the evidence block in a captured prompt, leaving everything else intact."""
+    return user_text.replace(render(evidence), render(reduced_evidence), 1)
 
 
 def _find_message_sources(tasks: list[dict], evidence: dict, response_field: str) -> dict:
@@ -180,11 +206,11 @@ def _find_message_sources(tasks: list[dict], evidence: dict, response_field: str
 
 def _invoke_judge(
     system_text: str,
-    instruction: str,
-    evidence: dict,
+    user_text: str,
     model_name: str,
     max_tokens: int,
 ) -> str:
+    """Re-run the judge on a prompt that is the captured one, edited only where intended."""
     model = ChatOpenAI(
         api_key=AGENT_API_KEY,
         base_url=AGENT["llm_server_url"],
@@ -196,7 +222,7 @@ def _invoke_judge(
     response = model.invoke(
         [
             {"role": "system", "content": system_text},
-            {"role": "user", "content": f"{instruction}\n\nEvidence:\n{evidence}"},
+            {"role": "user", "content": user_text},
         ]
     )
     return response.content
@@ -249,14 +275,12 @@ def analyze_workflow(
     source_items = list(sources.items())[:max_interventions]
 
     original_decision = judge_task["generated"]["response"]
-    system_text, instruction = _extract_prompt_parts(judge_invocation["used"]["prompt"])
+    system_text, user_text = _extract_prompt_parts(judge_invocation["used"]["prompt"])
+    rendering_name, render_evidence = find_evidence_rendering(user_text, evidence)
     metadata = judge_invocation.get("custom_metadata") or {}
     model_name = metadata.get("model_name") or AGENT["model"]
     max_tokens = (metadata.get("model_parameters") or {}).get("max_tokens", 350)
-    reproduced_baselines = [
-        _invoke_judge(system_text, instruction, evidence, model_name, max_tokens)
-        for _ in range(trials)
-    ]
+    reproduced_baselines = [_invoke_judge(system_text, user_text, model_name, max_tokens) for _ in range(trials)]
 
     counterfactuals = []
     causal_edges = []
@@ -270,8 +294,7 @@ def analyze_workflow(
                 future = executor.submit(
                     _invoke_judge,
                     system_text,
-                    instruction,
-                    reduced_evidence,
+                    apply_evidence(user_text, evidence, reduced_evidence, render_evidence),
                     model_name,
                     max_tokens,
                 )
@@ -314,8 +337,7 @@ def analyze_workflow(
         )
 
     baseline_trials = [
-        compare_outcomes(original_decision, reproduced, allowed_labels)
-        for reproduced in reproduced_baselines
+        compare_outcomes(original_decision, reproduced, allowed_labels) for reproduced in reproduced_baselines
     ]
     baseline_summary = summarize_trials(baseline_trials)
 
@@ -329,6 +351,7 @@ def analyze_workflow(
         "analyzed_intervention_count": len(source_items),
         "available_intervention_count": len(sources),
         "method": "repeated direct judge-input message removal with fixed model parameters",
+        "intervention_mechanism": (f"in-place edit of the captured prompt; evidence located as {rendering_name}"),
         "limitations": [
             "This estimates the direct effect of each observed message on the judge, conditional on other messages.",
             "It does not expose hidden chain-of-thought or estimate indirect effects through downstream agents.",
@@ -410,14 +433,14 @@ code{{background:#eef2f5;padding:2px 5px}}
 pre{{white-space:pre-wrap;background:#f6f8fa;padding:14px}}
 </style></head><body>
 <h1>Causal decision provenance</h1>
-<p><strong>Workflow:</strong> {escape(result['workflow_id'])}<br>
-<strong>Judge:</strong> {escape(result['decision_agent_id'])}<br>
-<strong>Method:</strong> {escape(result['method'])}<br>
-<strong>Trials per intervention:</strong> {result['trial_count']}<br>
+<p><strong>Workflow:</strong> {escape(result["workflow_id"])}<br>
+<strong>Judge:</strong> {escape(result["decision_agent_id"])}<br>
+<strong>Method:</strong> {escape(result["method"])}<br>
+<strong>Trials per intervention:</strong> {result["trial_count"]}<br>
 <strong>Interventions analyzed:</strong> {intervention_count} of {available_count}</p>
-<p><strong>Original outcome:</strong> {escape(result['original_decision']['label'])}<br>
+<p><strong>Original outcome:</strong> {escape(result["original_decision"]["label"])}<br>
 <strong>Reproduced full-input outcomes:</strong> {escape(reproduced_labels)}<br>
-<strong>Baseline reproduction:</strong> {escape(result['baseline_reproduction']['causal_conclusion'])}</p>
+<strong>Baseline reproduction:</strong> {escape(result["baseline_reproduction"]["causal_conclusion"])}</p>
 <h2>What the judge observed</h2>
 <p>These persisted agent messages were present in the judge's input.</p>
 <table><thead><tr><th>Source agent</th><th>Message</th><th>Visible excerpt</th></tr></thead>
@@ -434,10 +457,10 @@ this does not prove the message was irrelevant.
 <th>Outcome changes</th><th>Change rate</th>
 <th>Mean explanation change</th><th>Explanation sensitivity</th>
 </tr></thead><tbody>{rows}</tbody></table>
-<h2>Observed decision</h2><pre>{escape(result['original_decision']['visible_response'])}</pre>
+<h2>Observed decision</h2><pre>{escape(result["original_decision"]["visible_response"])}</pre>
 <h2>Structural provenance</h2><ul>{structural}</ul>
 <h2>Semantic provenance</h2><ul>{semantic}</ul>
-<h2>Method limits</h2><ul>{''.join(f'<li>{escape(item)}</li>' for item in result['limitations'])}</ul>
+<h2>Method limits</h2><ul>{"".join(f"<li>{escape(item)}</li>" for item in result["limitations"])}</ul>
 </body></html>"""
 
 

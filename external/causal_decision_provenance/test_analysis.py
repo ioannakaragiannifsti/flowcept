@@ -1,9 +1,15 @@
 """Behavior tests for the external causal decision-provenance analyzer."""
 
+import json
+
+import pytest
+
 from external.causal_decision_provenance.analysis import (
+    apply_evidence,
     build_structural_graph,
     compare_outcomes,
     extract_decision_label,
+    find_evidence_rendering,
     summarize_trials,
 )
 from flowcept import Flowcept, FlowceptTask
@@ -89,3 +95,51 @@ def test_trial_summary_distinguishes_outcome_from_explanation_effect():
     assert summary["baseline_label_counts"] == {"execute": 2}
     assert summary["counterfactual_label_counts"] == {"execute": 2}
     assert summary["mean_explanation_change"] > 0
+
+
+EVIDENCE = {"incident": "queue grew to 18,000", "risk_review": "acceptable with safeguards"}
+
+
+@pytest.mark.parametrize(
+    ("name", "render"),
+    [
+        ("json_indent_2", lambda e: json.dumps(e, indent=2, default=str)),
+        ("json_compact", lambda e: json.dumps(e, default=str)),
+        ("python_repr", str),
+    ],
+)
+def test_evidence_rendering_is_detected_for_each_supported_format(name, render):
+    """Locate the evidence block whichever way the MAS serialized it."""
+    user_text = f"DECISION TO MAKE:\nExecute?\n\nEVIDENCE:\n{render(EVIDENCE)}\n\nReply now."
+
+    detected_name, detected_render = find_evidence_rendering(user_text, EVIDENCE)
+
+    assert detected_name == name
+    assert detected_render(EVIDENCE) == render(EVIDENCE)
+
+
+def test_removed_evidence_leaves_the_rest_of_the_prompt_untouched():
+    """An intervention must differ from the original by exactly the removed message."""
+
+    def render(evidence):
+        return json.dumps(evidence, indent=2, default=str)
+
+    prefix = "DECISION TO MAKE:\nExecute?\n\nEVIDENCE:\n"
+    suffix = "\n\nWhat the answer must contain:\nDecide.\n\nReply now."
+    user_text = f"{prefix}{render(EVIDENCE)}{suffix}"
+    reduced = {"incident": EVIDENCE["incident"]}
+
+    edited = apply_evidence(user_text, EVIDENCE, reduced, render)
+
+    assert "acceptable with safeguards" not in edited
+    assert "queue grew to 18,000" in edited
+    assert edited.startswith(prefix)
+    assert edited.endswith(suffix)
+
+
+def test_unlocatable_evidence_is_an_error_rather_than_a_silent_no_op():
+    """A prompt the analyzer cannot edit must fail loudly, not report no influence."""
+    user_text = "Evidence was summarized by hand and never serialized verbatim."
+
+    with pytest.raises(ValueError, match="Could not locate the evidence block"):
+        find_evidence_rendering(user_text, EVIDENCE)
