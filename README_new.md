@@ -196,28 +196,78 @@ Ordinary provenance records what each agent *did*. Decision provenance also reco
 what each agent *could have done*: the alternatives it considered, how it scored
 them, and which one it selected. These are stored as tasks with `subtype: "decision"`.
 
-Flowcept never infers decisions. An agent's rejected alternatives exist only inside
-its reasoning, so each example must record them explicitly with `DecisionCapture`.
-Any new multi-agent system needs the same treatment; the UI side is generic and
-needs no per-system work.
+Flowcept captures decisions through an explicit `DecisionCapture.invoke()` call.
+The backend adds a domain-neutral system prompt and requests a structured decision,
+so application code no longer needs to append every candidate, assessment, and
+selection manually. The UI side is generic and needs no per-system work.
 
-`DecisionCapture` is a **context manager**. It is opened around the
-point where a choice is made, candidates and assessments are added to it, and the
-record is written when the block exits:
+`DecisionCapture` is a **context manager**, not a decorator. Attach an unwrapped
+LangChain model and call `invoke()` for the task whose decision provenance should be
+captured:
 
 ```python
-from flowcept import DecisionCapture
+from flowcept import DecisionCapture, Flowcept
 
-with DecisionCapture(decision_type="...", context={...}, agent_id="...") as decision:
-    for candidate in options:
-        decision.add_candidate(candidate["id"], content=candidate)
-    decision.assess(candidate_id, evaluator_id="...", score_type="...",
-                    score=0.85, explanation="why this scored as it did")
-    decision.select(winning_id)
+# Configure my_llm with the provider used by your application.
+with Flowcept(start_persistence=False), DecisionCapture(
+    decision_type="selection",
+    context="Choose the output that best satisfies the request",
+    agent_id="my-agent",
+    llm=my_llm,
+) as decision:
+    record = decision.invoke("Write a formal greeting.")
+
+print(record.to_dict())
 ```
 
-A `record_decision(...)` function exists for the case where a complete
-`DecisionRecord` has already been built elsewhere.
+The same pattern works for more complex, domain-specific agents. For example, a
+deployment agent can evaluate operational evidence and choose a rollout strategy
+without application code constructing or appending the candidates:
+
+```python
+from flowcept import DecisionCapture, Flowcept
+
+# Configure deployment_llm with the provider used by your application.
+deployment_request = """
+Choose a rollout strategy for release 4.2 using the following evidence:
+
+- The release contains a database migration that is backward compatible.
+- Staging tests passed, but the payment-service error rate briefly reached 1.8%.
+- The production SLO permits an error rate of at most 1.0%.
+- Rollback takes approximately four minutes.
+- The release must be available to all customers within 24 hours.
+
+Account for customer impact, rollback risk, observability, and the delivery
+deadline. Return the strategy the deployment agent should execute.
+"""
+
+with Flowcept(start_persistence=False), DecisionCapture(
+    decision_type="deployment_strategy",
+    context="Select a safe rollout plan from the available operational choices",
+    agent_id="deployment-agent",
+    llm=deployment_llm,
+) as decision:
+    deployment_decision = decision.invoke(deployment_request)
+
+print(deployment_decision.to_dict())
+```
+
+Here, `invoke()` instructs the model to generate and compare suitable alternatives
+such as a full rollout, canary rollout, staged rollout, or postponement. The caller
+provides the task and its evidence; `DecisionCapture` handles the decision-specific
+response structure and provenance capture. This makes the same approach reusable
+for incident response, test planning, routing, recommendation, approval, and other
+agent use cases.
+
+`invoke()` supplies an OpenAI-compatible JSON-schema response format and validates
+the model-generated candidates, assessment criteria, confidence scores,
+explanations, and selected candidate IDs before storing a `PROV_AGENT.DECISION`
+task. That decision is linked to the automatically captured LLM invocation.
+
+The model must accept the OpenAI-compatible JSON-schema `response_format`
+parameter. Importing `DecisionCapture` alone has no side effects; capture begins
+only when `invoke()` is called. Use a fresh `DecisionCapture` instance for each
+decision.
 
 There is one source of truth. The block above writes a single task with
 `subtype: "decision"` into MongoDB. The JSON you query and the **Decision Candidates**
@@ -244,8 +294,9 @@ ollama list
 ### Run the incident-response MAS
 
 Five agents triage an incident, find a root cause, plan a remediation, review its
-risk, and make a final call. Every agent must enumerate alternatives, score each
-one, and select one, so the run produces five decision records:
+risk, and make a final call. Each agent calls `DecisionCapture.invoke()`; the model
+returns its alternatives, assessments, and selection in the requested structured
+format, so the run produces five decision records:
 
 ```powershell
 $env:FLOWCEPT_SETTINGS_PATH = "$PWD\agent_sandbox\settings.yaml"
@@ -320,13 +371,14 @@ They are linked by `workflow_id` and `parent_task_id`.
 
 Five agents run in a chain. Each reads the incident plus everything the agents
 before it produced, then hands its answer to the next. That much is an ordinary
-pipeline. What makes it a decision-provenance example is a constraint on every
-agent: before it may answer, it must enumerate at least two genuinely different
-alternatives, score each, and select exactly one.
+pipeline. What makes it a decision-provenance example is that every agent runs its
+task through `DecisionCapture.invoke()`. The backend prompt requires the model to
+return genuinely different alternatives, assessments, and exactly one selection in
+the structured response.
 
-The rejected alternatives are the point. They exist nowhere else, because a single
-model response carries one answer rather than the option set. If the agent is not
-asked to name them, they are gone the moment the call returns.
+The rejected alternatives are the point. They are preserved because `invoke()` asks
+the model to include the option set in its response and validates that structure
+before recording the decision.
 
 #### Each agent leaves two records
 
@@ -502,11 +554,10 @@ $env:FLOWCEPT_SETTINGS_PATH = "$PWD\agent_sandbox\settings.yaml"
 
 ### A MAS example stops with a candidate or JSON error
 
-Messages such as `monitoring-agent returned 0 candidate(s); at least 2 are required`
-mean the local model did not produce the required decision structure. The example
-asks the model once more with a corrective message before failing, and both calls are
-captured. The example stops rather than recording an invented decision. Retry, or use
-a larger model with `--model`.
+Candidate-count or JSON-schema errors mean the local model did not return the
+structured decision required by `DecisionCapture.invoke()`. Application code should
+not repair the response by manually appending candidates. Retry the call, or use a
+larger model with `--model`.
 
 ### The Decision Candidates tab is empty
 
