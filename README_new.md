@@ -1,11 +1,34 @@
-# Running Flowcept and Its Official UI on Windows
+# Set Up Flowcept Decision Capture and the UI on Windows
 
-This guide records the setup used to run the Flowcept repository on this Windows
-computer. It covers Flowcept itself, MongoDB, Redis-compatible Memurai, the
-official Flowcept web UI, and the `DecisionCapture` extension for application
-agents.
+This guide takes a new Flowcept user from downloading and installing the project to
+adding decision provenance to an existing agent and viewing the captured decisions
+in the official UI. Run the commands in PowerShell unless stated otherwise.
 
-## What was configured
+## Prerequisites
+
+Install these tools before starting:
+
+- Python 3.10 or newer and `pip`.
+- Git, if you want to clone the source repository.
+- MongoDB and a Redis-compatible service such as Memurai for persistent capture.
+- Node.js and npm if you need to build the official UI from source.
+- A LangChain-compatible model that accepts the OpenAI-compatible JSON-schema
+  `response_format` parameter.
+
+## Download Flowcept
+
+Clone the official repository and enter its directory:
+
+```powershell
+git clone https://github.com/ORNL/flowcept.git
+cd flowcept
+```
+
+If Git is unavailable, download the repository ZIP from
+<https://github.com/ORNL/flowcept/archive/refs/heads/main.zip>, extract it, open
+PowerShell in the extracted `flowcept-main` directory, and continue below.
+
+## What this guide configures
 
 - A Python virtual environment at `.venv` instead of Conda.
 - Flowcept installed from this repository with MongoDB, Redis, telemetry, and
@@ -15,10 +38,7 @@ agents.
 - A repository-local settings file at `agent_sandbox/settings.yaml`.
 - The official React UI built into Flowcept's FastAPI webservice.
 
-Run every command below from the repository root in PowerShell:
-
-
-## One-time Python setup
+## Install Flowcept and its Python dependencies
 
 Create the virtual environment if `.venv` does not already exist:
 
@@ -32,14 +52,106 @@ Activate it:
 .\.venv\Scripts\Activate.ps1
 ```
 
-Install Flowcept and the dependencies required by the services and UI:
+Upgrade `pip`, then install Flowcept from the cloned source with the common runtime
+and webservice dependencies used by this guide:
 
 ```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[extras,webservice]"
 ```
 
 Conda is not required. Using `.\.venv\Scripts\python.exe` directly also works when
 the environment is not activated.
+
+If you only need the published package, install from PyPI instead. Clone the
+repository as described above if you later need its examples, settings template, or
+UI source files.
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install "flowcept[extras,webservice]"
+```
+
+## Add DecisionCapture to your agent
+
+`DecisionCapture` records not only the result an agent selected, but also the
+alternatives it considered, its assessments, explanations, confidence scores, and
+selected candidate IDs. Each captured decision is stored as a task with
+`subtype: "decision"`.
+
+The integration point is the model call. Create a fresh `DecisionCapture` context,
+attach the unwrapped LangChain model already used by your application, and replace
+that decision-making model call with `decision.invoke(...)`:
+
+```python
+from flowcept import DecisionCapture, Flowcept
+
+# Configure my_llm with the provider used by your application.
+with Flowcept(start_persistence=False), DecisionCapture(
+    decision_type="selection",
+    context="Choose the output that best satisfies the request",
+    agent_id="my-agent",
+    llm=my_llm,
+) as decision:
+    record = decision.invoke("Write a formal greeting.")
+
+print(record.to_dict())
+```
+
+For a realistic agent, pass the evidence, constraints, and requested outcome in the
+same prompt your agent would normally send to its model:
+
+```python
+from flowcept import DecisionCapture, Flowcept
+
+deployment_request = """
+Choose a rollout strategy for release 4.2 using the following evidence:
+
+- The release contains a backward-compatible database migration.
+- Staging tests passed, but the payment-service error rate briefly reached 1.8%.
+- The production SLO permits an error rate of at most 1.0%.
+- Rollback takes approximately four minutes.
+- The release must be available to all customers within 24 hours.
+
+Account for customer impact, rollback risk, observability, and the deadline.
+Return the strategy the deployment agent should execute.
+"""
+
+with Flowcept(start_persistence=False), DecisionCapture(
+    decision_type="deployment_strategy",
+    context="Select a safe rollout plan from the available operational choices",
+    agent_id="deployment-agent",
+    llm=deployment_llm,
+) as decision:
+    deployment_decision = decision.invoke(deployment_request)
+
+print(deployment_decision.to_dict())
+```
+
+You only provide the agent task, relevant evidence, and decision context. Do not
+append candidates or call separate assessment and selection methods. `invoke()` adds
+a domain-neutral decision system prompt, supplies the JSON-schema response format,
+and validates the model-generated decision before recording it. The decision is
+also linked to the automatically captured LLM invocation.
+
+Use this checklist when adapting the pattern:
+
+1. Pass the model through `llm=` without wrapping it in another agent executor.
+2. Give `decision_type` a stable category meaningful to your application.
+3. Use `context` to describe the goal and decision boundary.
+4. Put current evidence, constraints, and the requested outcome in the `invoke()`
+   prompt.
+5. Use a new `DecisionCapture` instance for every decision.
+6. Keep the call inside the relevant Flowcept workflow so its records share the
+   workflow ID.
+
+Importing or constructing `DecisionCapture` does not capture anything by itself;
+capture begins only when `invoke()` is called. The configured model must support the
+OpenAI-compatible JSON-schema `response_format` parameter.
+
+The examples above demonstrate the code integration. Complete the persistence and
+UI setup in the following sections to store and visualize those decisions.
 
 ## One-time settings setup
 
@@ -190,91 +302,7 @@ MongoDB by Flowcept.
 The UI reads the records stored in MongoDB. It does not execute or evaluate the
 workflow itself; Flowcept instrumentation captures the workflow while it runs.
 
-## Decision provenance
-
-Ordinary provenance records what each agent *did*. Decision provenance also records
-what each agent *could have done*: the alternatives it considered, how it scored
-them, and which one it selected. These are stored as tasks with `subtype: "decision"`.
-
-Flowcept captures decisions through an explicit `DecisionCapture.invoke()` call.
-The backend adds a domain-neutral system prompt and requests a structured decision,
-so application code no longer needs to append every candidate, assessment, and
-selection manually. The UI side is generic and needs no per-system work.
-
-`DecisionCapture` is a **context manager**, not a decorator. Attach an unwrapped
-LangChain model and call `invoke()` for the task whose decision provenance should be
-captured:
-
-```python
-from flowcept import DecisionCapture, Flowcept
-
-# Configure my_llm with the provider used by your application.
-with Flowcept(start_persistence=False), DecisionCapture(
-    decision_type="selection",
-    context="Choose the output that best satisfies the request",
-    agent_id="my-agent",
-    llm=my_llm,
-) as decision:
-    record = decision.invoke("Write a formal greeting.")
-
-print(record.to_dict())
-```
-
-The same pattern works for more complex, domain-specific agents. For example, a
-deployment agent can evaluate operational evidence and choose a rollout strategy
-without application code constructing or appending the candidates:
-
-```python
-from flowcept import DecisionCapture, Flowcept
-
-# Configure deployment_llm with the provider used by your application.
-deployment_request = """
-Choose a rollout strategy for release 4.2 using the following evidence:
-
-- The release contains a database migration that is backward compatible.
-- Staging tests passed, but the payment-service error rate briefly reached 1.8%.
-- The production SLO permits an error rate of at most 1.0%.
-- Rollback takes approximately four minutes.
-- The release must be available to all customers within 24 hours.
-
-Account for customer impact, rollback risk, observability, and the delivery
-deadline. Return the strategy the deployment agent should execute.
-"""
-
-with Flowcept(start_persistence=False), DecisionCapture(
-    decision_type="deployment_strategy",
-    context="Select a safe rollout plan from the available operational choices",
-    agent_id="deployment-agent",
-    llm=deployment_llm,
-) as decision:
-    deployment_decision = decision.invoke(deployment_request)
-
-print(deployment_decision.to_dict())
-```
-
-Here, `invoke()` instructs the model to generate and compare suitable alternatives
-such as a full rollout, canary rollout, staged rollout, or postponement. The caller
-provides the task and its evidence; `DecisionCapture` handles the decision-specific
-response structure and provenance capture. This makes the same approach reusable
-for incident response, test planning, routing, recommendation, approval, and other
-agent use cases.
-
-`invoke()` supplies an OpenAI-compatible JSON-schema response format and validates
-the model-generated candidates, assessment criteria, confidence scores,
-explanations, and selected candidate IDs before storing a `PROV_AGENT.DECISION`
-task. That decision is linked to the automatically captured LLM invocation.
-
-The model must accept the OpenAI-compatible JSON-schema `response_format`
-parameter. Importing `DecisionCapture` alone has no side effects; capture begins
-only when `invoke()` is called. Use a fresh `DecisionCapture` instance for each
-decision.
-
-There is one source of truth. The block above writes a single task with
-`subtype: "decision"` into MongoDB. The JSON you query and the **Decision Candidates**
-view in the UI both read that same task — the UI adds no capture of its own and
-stores nothing extra. Anything missing from the UI is missing from the record.
-
-### Inspect decisions in the UI
+## Inspect captured decisions in the UI
 
 After running your application with persistence enabled:
 
