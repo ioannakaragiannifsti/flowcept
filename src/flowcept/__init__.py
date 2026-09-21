@@ -91,6 +91,33 @@ def __getattr__(name):
             "DecisionRecord": DecisionRecord,
         }[name]
 
+    elif name in {"Retrieval", "RetrievedItem", "EvidenceUse"}:
+        from flowcept.commons.flowcept_dataclasses.retrieval_provenance import (
+            EvidenceUse,
+            Retrieval,
+            RetrievedItem,
+        )
+
+        return {
+            "Retrieval": Retrieval,
+            "RetrievedItem": RetrievedItem,
+            "EvidenceUse": EvidenceUse,
+        }[name]
+
+    elif name in {
+        "record_retrieval",
+        "ToolCapture",
+        "flowcept_tool",
+        "FlowceptTool",
+        "retrieval_scope",
+        "current_retrievals",
+        "normalize_retrieved_items",
+        "propagate_scope",
+        "materialize",
+    }:
+        from flowcept.instrumentation import tool_provenance
+
+        return getattr(tool_provenance, name)
     elif name == "record_decision":
         from flowcept.instrumentation.decision_provenance import record_decision
 
@@ -120,6 +147,17 @@ __all__ = [
     "DecisionRecord",
     "record_decision",
     "DecisionCapture",
+    "Retrieval",
+    "RetrievedItem",
+    "EvidenceUse",
+    "record_retrieval",
+    "ToolCapture",
+    "flowcept_tool",
+    "FlowceptTool",
+    "retrieval_scope",
+    "current_retrievals",
+    "normalize_retrieved_items",
+    "propagate_scope",
     "__version__",
     "SETTINGS_PATH",
 ]

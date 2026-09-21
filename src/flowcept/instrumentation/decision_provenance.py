@@ -1,11 +1,16 @@
 """Capture generic decision provenance through Flowcept tasks."""
 
+import json
 from uuid import uuid4
 
 from flowcept.commons.flowcept_dataclasses.decision_provenance import (
     Assessment,
     Candidate,
     DecisionRecord,
+)
+from flowcept.commons.flowcept_dataclasses.retrieval_provenance import (
+    EvidenceUse,
+    Retrieval,
 )
 from flowcept.commons.vocabulary import PROV_AGENT
 from flowcept.instrumentation.task_capture import FlowceptTask
@@ -27,11 +32,16 @@ def record_decision(
         used={
             "context": decision.context,
             "input_entity_ids": decision.input_entity_ids,
+            # The retrievals this decision consumed, so the decision task points back at the
+            # agent_tool tasks that produced its evidence.
+            "retrieval_ids": [retrieval.retrieval_id for retrieval in decision.retrievals],
+            "queries": [retrieval.query for retrieval in decision.retrievals],
         },
         custom_metadata={
             "decision_id": decision.decision_id,
             "decision_type": decision.decision_type,
             "schema_version": decision.schema_version,
+            "grounding": decision.grounding_summary(),
         },
         capture_telemetry=False,
     )
@@ -58,6 +68,9 @@ class DecisionCapture:
         input_entity_ids: list[str] | None = None,
         output_entity_ids: list[str] | None = None,
         llm=None,
+        retrievals: list[Retrieval] | None = None,
+        prompt_item_chars: int = 800,
+        prompt_max_items: int = 0,
     ):
         self.decision_type = decision_type
         self.context = context
@@ -69,6 +82,19 @@ class DecisionCapture:
         self.candidates = []
         self.assessments = []
         self.selected_candidate_ids = []
+        # No retrievals argument means "whatever this agent's tools just retrieved", so a
+        # MAS gets grounded decisions without threading retrievals through its call stack.
+        # An explicit empty list still means "no evidence", which is how an agent that uses
+        # no tools keeps the plain decision contract.
+        from flowcept.instrumentation.tool_provenance import current_retrievals
+
+        self.retrievals = list(retrievals) if retrievals is not None else current_retrievals()
+        self.evidence_uses = []
+        # These budget only the copy of the evidence sent to the model. The recorded
+        # retrievals keep whatever the tools returned, in full: a context window is a hard
+        # limit on what a model can read, not a reason to store less than was retrieved.
+        self.prompt_item_chars = prompt_item_chars
+        self.prompt_max_items = prompt_max_items
         self.record = None
         self.task_id = None
         self.llm = llm
@@ -76,6 +102,94 @@ class DecisionCapture:
 
     def __enter__(self):
         return self
+
+    def add_retrieval(self, retrieval: Retrieval) -> Retrieval:
+        """Attach a tool retrieval whose items this decision must be grounded in.
+
+        Attach it before invoking: ``invoke`` puts the retrieved items in the prompt and
+        switches to the grounded contract, which makes reporting their use mandatory.
+        """
+        if self.record is not None:
+            raise ValueError("DecisionCapture already recorded a decision; use a fresh capture")
+        self.retrievals.append(retrieval)
+        return retrieval
+
+    def use_evidence(
+        self,
+        item_id: str,
+        used: bool,
+        role: str | None = None,
+        explanation: str | None = None,
+        candidate_id: str | None = None,
+    ) -> EvidenceUse:
+        """Record whether one retrieved item was kept for this decision, and why."""
+        evidence_use = EvidenceUse(
+            item_id=item_id,
+            used=used,
+            retrieval_id=self._retrieval_id_for(item_id),
+            role=role,
+            explanation=explanation,
+            candidate_id=candidate_id,
+        )
+        self.evidence_uses.append(evidence_use)
+        return evidence_use
+
+    def _retrieval_id_for(self, item_id: str) -> str | None:
+        """Find which retrieval returned an item, so evidence points back at its tool call."""
+        for retrieval in self.retrievals:
+            if item_id in retrieval.item_ids:
+                return retrieval.retrieval_id
+        return None
+
+    def _retrieved_for_prompt(self) -> list[dict]:
+        """Render retrieved items for the prompt, tagged with the tool that returned them.
+
+        Content is shortened to ``prompt_item_chars`` so a large result set cannot overrun
+        the model's context window, which providers truncate silently and which would leave
+        the model reading a cut-off schema. Only this copy is shortened; the stored
+        retrievals are untouched, and every ``item_id`` is still present, so the verdicts
+        the model returns still cover the whole result set.
+        """
+        rendered = []
+        for retrieval in self.retrievals:
+            for item in retrieval.items:
+                content = item.content
+                if self.prompt_item_chars:
+                    try:
+                        text = content if isinstance(content, str) else json.dumps(content, default=str)
+                    except Exception:  # noqa: BLE001 - an unrenderable payload still needs an entry
+                        text = str(content)
+                    if len(text) > self.prompt_item_chars:
+                        content = text[: self.prompt_item_chars]
+                        rendered.append(
+                            {
+                                "item_id": item.item_id,
+                                "tool_name": retrieval.tool_name,
+                                "query": retrieval.query,
+                                "source": item.source,
+                                "content": content,
+                                # Told explicitly, so the model treats a partial payload as
+                                # partial rather than as the whole document.
+                                "content_is_truncated_preview": True,
+                                "full_content_chars": len(text),
+                            }
+                        )
+                        continue
+                rendered.append(
+                    {
+                        "item_id": item.item_id,
+                        "tool_name": retrieval.tool_name,
+                        "query": retrieval.query,
+                        "source": item.source,
+                        "content": content,
+                    }
+                )
+
+        if self.prompt_max_items and len(rendered) > self.prompt_max_items:
+            # Dropping items entirely means the model cannot report on them, so the
+            # decision would be incomplete; keep this off unless a caller opts in.
+            rendered = rendered[: self.prompt_max_items]
+        return rendered
 
     def invoke(self, request: str, **kwargs) -> DecisionRecord:
         """Invoke an attached, unwrapped LangChain model and record one validated decision.
@@ -90,9 +204,12 @@ class DecisionCapture:
             raise ValueError("Attach an llm to DecisionCapture before invoking it")
         self._check_automatic_capture()
         # Keep optional LLM dependencies out of manual capture and package imports.
-        from flowcept.instrumentation.decision_response import DecisionResponse
+        from flowcept.instrumentation.decision_response import DecisionResponse, GroundedDecisionResponse
         from flowcept.instrumentation.flowcept_agent_task import FlowceptLLM
 
+        # With retrievals attached, the model is held to the grounded contract, which adds
+        # a mandatory per-item verdict on the evidence it was given.
+        response_model = GroundedDecisionResponse if self.retrievals else DecisionResponse
         self._automatic = True
         invocation_task_id = str(uuid4())
         wrapped = FlowceptLLM(
@@ -104,10 +221,15 @@ class DecisionCapture:
         )
         response = wrapped.invoke(
             [
-                {"role": "system", "content": DecisionResponse.build_prompt(self.decision_type, self.context)},
+                {
+                    "role": "system",
+                    "content": response_model.build_prompt(
+                        self.decision_type, self.context, self._retrieved_for_prompt()
+                    ),
+                },
                 {"role": "user", "content": request},
             ],
-            response_format=DecisionResponse.response_format(),
+            response_format=response_model.response_format(),
             **kwargs,
         )
         return self.record_response(response, invocation_task_id=invocation_task_id)
@@ -126,10 +248,15 @@ class DecisionCapture:
         """
         self._check_automatic_capture()
         # Pydantic is provided by the optional LLM dependencies.
-        from flowcept.instrumentation.decision_response import DecisionResponse
+        from flowcept.instrumentation.decision_response import DecisionResponse, GroundedDecisionResponse
 
         self._automatic = True
-        output = DecisionResponse.model_validate_json(response)
+        response_model = GroundedDecisionResponse if self.retrievals else DecisionResponse
+        output = response_model.model_validate_json(response)
+        for evidence_use in getattr(output, "evidence_uses", []):
+            # An item_id the model invented has no retrieval behind it, so it would make the
+            # grounding trail untrue; DecisionRecord rejects it rather than storing it.
+            self.use_evidence(**evidence_use.model_dump())
         for candidate in output.candidates:
             self.add_candidate(candidate.candidate_id, content=candidate.content)
         for assessment in output.assessments:
@@ -212,6 +339,8 @@ class DecisionCapture:
             selected_candidate_ids=self.selected_candidate_ids,
             input_entity_ids=self.input_entity_ids,
             output_entity_ids=self.output_entity_ids,
+            retrievals=self.retrievals,
+            evidence_uses=self.evidence_uses,
         )
         self.task_id = record_decision(
             decision=self.record,

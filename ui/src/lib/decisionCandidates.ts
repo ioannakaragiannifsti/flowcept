@@ -1,6 +1,13 @@
 import type { Task } from "../api/types";
 
-export type DecisionCandidateNodeKind = "agent" | "evidence" | "assessment" | "candidate" | "decision" | "output";
+export type DecisionCandidateNodeKind =
+  | "agent"
+  | "tool"
+  | "evidence"
+  | "assessment"
+  | "candidate"
+  | "decision"
+  | "output";
 export type DecisionCandidateRelation =
   | "made"
   | "informed"
@@ -10,7 +17,10 @@ export type DecisionCandidateRelation =
   | "selected"
   | "rejected"
   | "considered"
-  | "generated";
+  | "generated"
+  | "retrieved"
+  | "kept"
+  | "dropped";
 
 export interface DecisionCandidateNode {
   id: string;
@@ -18,9 +28,23 @@ export interface DecisionCandidateNode {
   label: string;
   /** Short human-readable descriptor shown under the label. */
   sublabel?: string;
+  /**
+   * What the tool actually produced, shown verbatim on the node: the query for a tool,
+   * the retrieved content for an evidence item. Kept separate from `sublabel` so the
+   * agent's commentary never displaces the data it was commenting on.
+   */
+  preview?: string;
+  /** Short facts worth seeing without clicking: tool type, result count, score, source. */
+  badges?: string[];
   /** Headline score shown on the node, when one was assessed. */
   score?: number;
   selected?: boolean;
+  /**
+   * For evidence retrieved by a tool: whether the decision kept it. `undefined` means the
+   * item was never judged, either because it came from an entity id rather than a tool
+   * call, or because the agent failed to report a verdict on it.
+   */
+  kept?: boolean;
   details: Record<string, unknown>;
 }
 
@@ -48,6 +72,10 @@ function asStrings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
 function labelValue(value: unknown, fallback: string): string {
   if (typeof value === "string" && value) return value;
   if (value !== undefined && value !== null) return JSON.stringify(value);
@@ -55,7 +83,32 @@ function labelValue(value: unknown, fallback: string): string {
 }
 
 /** Short descriptive fields a domain may use to name an alternative. */
-const SUMMARY_FIELDS = ["strategy", "summary", "title", "name", "label", "description", "test_id"];
+const SUMMARY_FIELDS = [
+  "strategy",
+  "summary",
+  "title",
+  "name",
+  "label",
+  "description",
+  "test_id",
+  // Fields retrieval tools commonly carry their text in, so a search hit shows its text
+  // rather than nothing at all.
+  "body",
+  "snippet",
+  "text",
+  "abstract",
+  "page_content",
+  "content",
+];
+
+/** Render a payload for display on a node, verbatim but bounded. */
+function previewText(value: unknown, maxLength = 260): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (!text) return undefined;
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > maxLength ? `${compact.slice(0, maxLength)}…` : compact;
+}
 
 /** Pick a short readable descriptor out of an arbitrary candidate payload. */
 function summarize(content: unknown): string | undefined {
@@ -111,6 +164,85 @@ export function buildDecisionCandidates(tasks: Task[]): DecisionCandidates {
       const evidenceId = `evidence:${inputId}`;
       addNode({ id: evidenceId, kind: "evidence", label: inputId, details: { entity_id: inputId } });
       addEdge({ source: evidenceId, target: decisionId, relation: "informed" });
+    }
+
+    // Tool retrievals: every item a tool returned becomes an evidence node, whether or not
+    // the agent kept it. Drawing the discarded ones is the point -- they are invisible in
+    // the agent's answer and only provenance records that they were ever seen.
+    const verdictByItem = new Map<string, Record<string, unknown>>();
+    for (const use of asRecords(decision.evidence_uses)) {
+      const itemId = asString(use.item_id);
+      if (itemId) verdictByItem.set(itemId, use);
+    }
+
+    for (const retrieval of asRecords(decision.retrievals)) {
+      const toolName = labelValue(retrieval.tool_name, "tool");
+      const toolNodeId = `tool:${labelValue(retrieval.retrieval_id, toolName)}`;
+      const retrievedRows = asRecords(retrieval.retrieved);
+      const toolBadges = [asString(retrieval.tool_type), `${retrievedRows.length} retrieved`].filter(
+        (badge): badge is string => Boolean(badge),
+      );
+      const truncation = asRecord(retrieval.truncation);
+      if (Object.keys(truncation).length) toolBadges.push("result capped");
+      addNode({
+        id: toolNodeId,
+        kind: "tool",
+        label: toolName,
+        // The query verbatim: it is the thing the agent wrote, and paraphrasing it would
+        // defeat the point of recording it.
+        preview: previewText(retrieval.query),
+        badges: toolBadges,
+        details: retrieval,
+      });
+      if (task.agent_id) addEdge({ source: `agent:${task.agent_id}`, target: toolNodeId, relation: "performed" });
+
+      for (const item of asRecords(retrieval.retrieved)) {
+        const itemId = asString(item.item_id);
+        if (!itemId) continue;
+        const evidenceNodeId = `evidence:${itemId}`;
+        const verdict = verdictByItem.get(itemId) ?? {};
+        const kept = typeof verdict.used === "boolean" ? verdict.used : undefined;
+        const role = asString(verdict.role);
+        const explanation = asString(verdict.explanation);
+
+        // What the tool returned, shown as-is, and the agent's verdict shown beside it
+        // rather than instead of it.
+        const content = previewText(item.content ?? summarize(item.content));
+        const badges = [
+          role,
+          asString(item.source),
+          item.score === undefined || item.score === null ? undefined : `score ${String(item.score)}`,
+        ].filter((badge): badge is string => Boolean(badge));
+
+        const existing = nodes.get(evidenceNodeId);
+        if (existing) {
+          // An input entity and a retrieved item can share an id; keep one node and let
+          // the tool verdict enrich it rather than silently dropping either.
+          existing.kept ??= kept;
+          existing.preview ??= content;
+          existing.sublabel ??= explanation;
+          existing.badges = [...(existing.badges ?? []), ...badges];
+          existing.details = { ...existing.details, ...item, ...verdict };
+        } else {
+          addNode({
+            id: evidenceNodeId,
+            kind: "evidence",
+            label: itemId,
+            preview: content,
+            sublabel: explanation,
+            badges,
+            kept,
+            details: { tool_name: toolName, role, ...item, ...verdict },
+          });
+        }
+
+        addEdge({ source: toolNodeId, target: evidenceNodeId, relation: "retrieved" });
+        // No edge into the decision when the agent never reported a verdict: the item was
+        // retrieved but never judged, and inventing an edge would hide that.
+        if (kept !== undefined) {
+          addEdge({ source: evidenceNodeId, target: decisionId, relation: kept ? "kept" : "dropped" });
+        }
+      }
     }
 
     const selectedIds = new Set(asStrings(decision.selected_candidate_ids));

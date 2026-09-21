@@ -25,12 +25,13 @@ import { ActivityDrawer } from "../components/tasks/ActivityDrawer";
 import { apiDelete, apiPost } from "../api/client";
 import { fmtDuration, fmtTs, shortId, statusColor, taskDuration, toEpochSec, type TimeValue } from "../lib/format";
 import { getAiModelUsageRows, type AiModelUsageRow } from "../lib/aiUsage";
+import { getToolUsageRows, type ToolUsageRow } from "../lib/toolUsage";
 import { ChartRenderer } from "../components/dashboard/ChartRenderer";
 import { chart, dashboardSpec, type DashboardSpec } from "../components/dashboard/spec";
 import { useInspectorStore } from "../stores/inspectorStore";
 import { taskToInspectorEntity } from "../lib/inspectorEntities";
 
-const TABS = ["tasks", "agents", "ai", "graph", "timeline", "telemetry", "card", "artifacts", "dashboard", "raw"] as const;
+const TABS = ["tasks", "agents", "ai", "tools", "graph", "timeline", "telemetry", "card", "artifacts", "dashboard", "raw"] as const;
 
 export const Route = createFileRoute("/workflows/$workflowId")({
   component: WorkflowDetail,
@@ -275,7 +276,7 @@ function WorkflowDetail() {
                 search.tab === t ? "border-accent text-fg border-b-2" : "text-fg-muted hover:text-fg"
               }`}
             >
-              {t === "card" ? "Workflow Card" : t === "dashboard" ? "Dashboard" : t === "graph" ? "Graphs" : t === "ai" ? "AI Model Usage" : t}
+              {t === "card" ? "Workflow Card" : t === "dashboard" ? "Dashboard" : t === "graph" ? "Graphs" : t === "ai" ? "AI Model Usage" : t === "tools" ? "Tools" : t}
             </button>
           ))}
         </div>
@@ -327,6 +328,13 @@ function WorkflowDetail() {
         <AiModelUsageTab
           tasks={taskItems}
           onTaskClick={(taskId) => navigate({ search: (s) => ({ ...s, task: taskId }) })}
+        />
+      )}
+
+      {search.tab === "tools" && (
+        <ToolUsageTab
+          tasks={taskItems}
+          onTaskClick={(taskId) => navigate({ search: (prev) => ({ ...prev, task: taskId }) })}
         />
       )}
 
@@ -545,6 +553,99 @@ function AiModelUsageTab({ tasks, onTaskClick }: { tasks: Task[]; onTaskClick: (
       <div className="card p-4">
         <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-fg-muted">Raw AI model invocation tasks</div>
         <JsonTree data={rows.map((row) => row.task)} name="ai_model_invocations" />
+      </div>
+    </div>
+  );
+}
+
+const TOOL_USAGE_COLS: ColumnDef<ToolUsageRow, any>[] = [
+  {
+    id: "tool_name",
+    header: "Tool",
+    size: 150,
+    cell: ({ row }) => <span className="font-semibold">{row.original.tool_name}</span>,
+  },
+  {
+    id: "tool_type",
+    header: "Type",
+    size: 110,
+    cell: ({ row }) => <span className="text-fg-muted">{row.original.tool_type ?? "—"}</span>,
+  },
+  {
+    id: "agent_id",
+    header: "Agent",
+    size: 160,
+    cell: ({ row }) => <span className="text-fg-muted">{row.original.agent_id ?? "—"}</span>,
+  },
+  {
+    id: "query",
+    header: "Query",
+    size: 360,
+    cell: ({ row }) => (
+      <span className="font-mono text-[11px]" title={row.original.query_preview}>
+        {row.original.query_preview || "—"}
+      </span>
+    ),
+  },
+  {
+    id: "retrieved_count",
+    header: "Retrieved",
+    size: 90,
+    cell: ({ row }) => <span className="font-mono">{row.original.retrieved_count}</span>,
+  },
+  {
+    id: "task_id",
+    header: "Task",
+    size: 130,
+    cell: ({ row }) => <span className="font-mono text-accent">{shortId(row.original.task_id, 12)}</span>,
+  },
+  {
+    id: "started_at",
+    header: "Started",
+    size: 150,
+    cell: ({ row }) => fmtTs(row.original.started_at),
+  },
+  {
+    id: "duration",
+    header: "Duration",
+    size: 100,
+    cell: ({ row }) => fmtDuration(row.original.duration),
+  },
+];
+
+/** Tool calls an agent made, with the query each ran and how much it brought back. */
+function ToolUsageTab({ tasks, onTaskClick }: { tasks: Task[]; onTaskClick: (taskId: string) => void }) {
+  const rows = useMemo(() => getToolUsageRows(tasks), [tasks]);
+  const totals = useMemo(
+    () => ({
+      calls: rows.length,
+      tools: new Set(rows.map((row) => row.tool_name)).size,
+      retrieved: rows.reduce((sum, row) => sum + row.retrieved_count, 0),
+      agents: new Set(rows.map((row) => row.agent_id).filter(Boolean)).size,
+    }),
+    [rows],
+  );
+
+  if (!rows.length) {
+    return <div className="card p-4 text-sm text-fg-muted">No agent tool calls found for this workflow.</div>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="grid gap-3 sm:grid-cols-4">
+        <MetricCard label="tool calls" value={String(totals.calls)} />
+        <MetricCard label="distinct tools" value={String(totals.tools)} />
+        <MetricCard label="items retrieved" value={String(totals.retrieved)} />
+        <MetricCard label="calling agents" value={String(totals.agents)} />
+      </div>
+      <div className="card p-4">
+        <DataTable data={rows} columns={TOOL_USAGE_COLS} onRowClick={(row) => onTaskClick(row.task_id)} />
+      </div>
+      <div className="card p-4">
+        <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-fg-muted">
+          Raw agent tool tasks (full retrieved result sets)
+        </div>
+        <JsonTree data={rows.map((row) => row.task)} name="agent_tools" />
       </div>
     </div>
   );

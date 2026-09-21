@@ -23,15 +23,17 @@ import { useInspectorStore } from "../../stores/inspectorStore";
 
 const COLUMN: Record<DecisionCandidateNodeKind, number> = {
   agent: 0,
-  evidence: 0,
-  assessment: 1,
-  candidate: 2,
-  decision: 3,
-  output: 4,
+  tool: 0,
+  evidence: 1,
+  assessment: 2,
+  candidate: 3,
+  decision: 4,
+  output: 5,
 };
 
 const NODE_STYLE: Record<DecisionCandidateNodeKind, CSSProperties> = {
   agent: { background: "#E9D5FF", border: "1.5px solid #7E22CE", borderRadius: 18 },
+  tool: { background: "#CFFAFE", border: "1.5px solid #0E7490", borderRadius: 18 },
   evidence: { background: "#FFFC87", border: "1.5px solid #808080", borderRadius: 18 },
   assessment: { background: "#FED7AA", border: "1.5px solid #C2410C", borderRadius: 5 },
   candidate: { background: "#F1F5F9", border: "1.5px solid #64748B", borderRadius: 5 },
@@ -40,20 +42,39 @@ const NODE_STYLE: Record<DecisionCandidateNodeKind, CSSProperties> = {
 };
 
 function edgeStyle(relation: DecisionCandidateRelation): CSSProperties {
-  if (relation === "selected") return { stroke: "#15803D", strokeWidth: 3 };
-  if (relation === "rejected") return { stroke: "#B91C1C", strokeDasharray: "5 4" };
+  if (relation === "selected" || relation === "kept") return { stroke: "#15803D", strokeWidth: 3 };
+  // Dropped evidence keeps the same dashed-red vocabulary as a rejected alternative: in
+  // both cases the agent considered something and then set it aside.
+  if (relation === "rejected" || relation === "dropped") return { stroke: "#B91C1C", strokeDasharray: "5 4" };
   if (relation === "supports" || relation === "informed") return { stroke: "#A16207" };
   if (relation === "made" || relation === "performed") return { stroke: "#7E22CE" };
+  if (relation === "retrieved") return { stroke: "#0E7490" };
   return { stroke: "#64748B" };
 }
 
 function nodeLabel(node: DecisionCandidateNode) {
   return (
-    <div className="max-w-48 text-center">
+    <div className="max-w-64 text-center" title={[node.label, node.preview, node.sublabel].filter(Boolean).join("\n\n")}>
       <div className="text-[9px] font-semibold uppercase tracking-wide opacity-65">{node.kind}</div>
-      <div className="line-clamp-2 text-[11px] font-semibold">{node.label}</div>
+      <div className="line-clamp-2 break-all text-[11px] font-semibold">{node.label}</div>
+      {node.badges && node.badges.length > 0 && (
+        <div className="mt-0.5 flex flex-wrap justify-center gap-1">
+          {node.badges.map((badge) => (
+            <span key={badge} className="rounded bg-black/10 px-1 text-[8px] leading-4 opacity-80">
+              {badge}
+            </span>
+          ))}
+        </div>
+      )}
+      {node.preview && (
+        // The query or the retrieved content, verbatim and monospaced so SQL and JSON stay
+        // legible. Hover shows the whole thing; clicking opens the raw record.
+        <div className="mt-1 line-clamp-4 break-words text-left font-mono text-[8px] leading-snug opacity-90">
+          {node.preview}
+        </div>
+      )}
       {node.sublabel && (
-        <div className="line-clamp-2 text-[9px] leading-snug opacity-75">{node.sublabel}</div>
+        <div className="mt-1 line-clamp-2 text-[9px] italic leading-snug opacity-75">{node.sublabel}</div>
       )}
       {node.score !== undefined && (
         <div className="mt-0.5 text-[9px] font-mono font-semibold">score {node.score}</div>
@@ -63,6 +84,11 @@ function nodeLabel(node: DecisionCandidateNode) {
           className={`mt-1 text-[9px] font-bold uppercase ${node.selected ? "text-green-800" : "text-red-800"}`}
         >
           {node.selected ? "selected" : "not selected"}
+        </div>
+      )}
+      {node.kind === "evidence" && node.kept !== undefined && (
+        <div className={`mt-1 text-[9px] font-bold uppercase ${node.kept ? "text-green-800" : "text-red-800"}`}>
+          {node.kept ? "kept" : "dropped"}
         </div>
       )}
     </div>
@@ -90,10 +116,19 @@ export function DecisionCandidatesView({ tasks, height }: Props) {
         const selectedStyle =
           node.kind === "candidate" && node.selected
             ? { background: "#DCFCE7", border: "2px solid #15803D" }
-            : {};
+            : node.kind === "evidence" && node.kept === false
+              ? // Dropped evidence is faded, not hidden: it stays readable but never
+                // competes with the evidence the decision actually rested on.
+                { background: "#FEE2E2", border: "1.5px dashed #B91C1C", opacity: 0.75 }
+              : node.kind === "evidence" && node.kept === true
+                ? { background: "#DCFCE7", border: "1.5px solid #15803D" }
+                : {};
+        // Tool and evidence nodes carry a verbatim payload, so they get more room; the
+        // rest keep the compact size they had.
+        const wide = node.kind === "tool" || node.kind === "evidence";
         return {
           id: node.id,
-          position: { x: column * 250, y: row * 110 },
+          position: { x: column * 320, y: row * (wide ? 190 : 130) },
           data: { label: nodeLabel(node), traceNode: node },
           sourcePosition: Position.Right,
           targetPosition: Position.Left,
@@ -103,7 +138,7 @@ export function DecisionCandidatesView({ tasks, height }: Props) {
             color: "#111827",
             padding: "9px 14px",
             fontSize: 11,
-            width: 190,
+            width: wide ? 250 : 190,
           },
         };
       }),
@@ -128,8 +163,10 @@ export function DecisionCandidatesView({ tasks, height }: Props) {
   return (
     <div className={`space-y-2 ${height === "100%" ? "flex h-full flex-1 flex-col" : ""}`}>
       <p className="text-fg-muted text-[11px]">
-        Follow evidence and assessments into alternatives, then see which alternative the decision agent selected.
-        Click a node to inspect its captured record.
+        Follow tool retrievals and assessments into alternatives, then see which alternative the decision agent
+        selected. Tool nodes show the query the agent wrote; evidence nodes show what came back, marked kept or
+        dropped, so discarded results stay visible. Hover a node for the full text, or click it for the complete
+        raw record — for a tool that is every item it returned.
       </p>
       <div
         style={{ height: height ?? 440 }}
@@ -158,8 +195,9 @@ export function DecisionCandidatesView({ tasks, height }: Props) {
         </ReactFlowProvider>
       </div>
       <div className="flex flex-wrap gap-3 text-[11px] text-fg-muted">
-        <span>green = selected</span>
-        <span>red dashed edge = rejected</span>
+        <span>green = selected / kept</span>
+        <span>red dashed edge = rejected / dropped</span>
+        <span>teal = tool call and its retrievals</span>
         <span>gold edge = evidence</span>
         <span>purple edge = agent responsibility</span>
       </div>

@@ -61,3 +61,6 @@ ui/docs/
 ui/test-results/
 ui/playwright-report/
 .codex/
+
+# Saved example runs (terminal transcript + structured provenance)
+runs/
