@@ -327,3 +327,89 @@ def test_prompt_budget_shortens_only_the_model_copy():
     assert [entry["item_id"] for entry in rendered] == ["doc-1", "doc-2"]
     # The stored retrieval still holds the whole document.
     assert len(capture.retrievals[0].items[0].content) == 5000
+
+
+def test_normalizes_elasticsearch_response():
+    """Unwrap a nested hits envelope and keep the relevance score and document body."""
+    items = normalize_retrieved_items(
+        {
+            "took": 5,
+            "hits": {
+                "total": {"value": 2},
+                "hits": [
+                    {"_id": "doc-1", "_score": 3.2, "_source": {"title": "Ack failures"}},
+                    {"_id": "doc-2", "_score": 1.1, "_source": {"title": "Other"}},
+                ],
+            },
+        }
+    )
+
+    assert [item.item_id for item in items] == ["doc-1", "doc-2"]
+    assert [item.score for item in items] == [3.2, 1.1]
+    assert items[0].content == {"title": "Ack failures"}
+
+
+def test_normalizes_column_oriented_vector_store():
+    """Chroma-style parallel arrays are zipped back into one item per position."""
+    items = normalize_retrieved_items(
+        {
+            "ids": [["v1", "v2"]],
+            "documents": [["text one", "text two"]],
+            "distances": [[0.1, 0.4]],
+        }
+    )
+
+    assert [item.item_id for item in items] == ["v1", "v2"]
+    assert [item.content for item in items] == ["text one", "text two"]
+    # Distance is recorded as given; smaller is closer, and inverting it would be a guess.
+    assert [item.score for item in items] == [0.1, 0.4]
+
+
+def test_normalizes_sparql_and_unknown_envelopes():
+    """Descend through a named envelope, and through an unknown single-key wrapper."""
+    sparql = normalize_retrieved_items(
+        {"results": {"bindings": [{"s": {"value": "http://x/1"}}, {"s": {"value": "http://x/2"}}]}}
+    )
+    assert len(sparql) == 2
+
+    # Solr nests under "response", which is not a name this knows.
+    solr = normalize_retrieved_items({"response": {"numFound": 2, "docs": [{"id": "s1"}, {"id": "s2"}]}})
+    assert [item.item_id for item in solr] == ["s1", "s2"]
+
+
+def test_normalizes_dataframe_rows():
+    """A table becomes one item per row, not one item holding the whole table."""
+    pandas = pytest.importorskip("pandas")
+    frame = pandas.DataFrame([{"id": "r1", "v": 1}, {"id": "r2", "v": 2}])
+
+    items = normalize_retrieved_items(frame)
+
+    assert [item.item_id for item in items] == ["r1", "r2"]
+    assert items[0].content == {"id": "r1", "v": 1}
+
+
+def test_single_record_is_not_split_into_fields():
+    """One result stays one item, while an id-to-content mapping still becomes many."""
+    single = normalize_retrieved_items({"id": "one", "content": "x"})
+    assert [(item.item_id, item.content) for item in single] == [("one", "x")]
+
+    mapping = normalize_retrieved_items({"doc-1": "x", "doc-2": "y"})
+    assert [item.item_id for item in mapping] == ["doc-1", "doc-2"]
+
+
+def test_query_method_is_recorded():
+    """How the agent searched is captured alongside what it searched for."""
+
+    @flowcept_tool(tool_type="database", query_method="cypher", query_arg="cypher")
+    def graph_db(cypher: str):
+        return [{"id": "n1", "name": "Service A"}]
+
+    with Flowcept(start_persistence=False), retrieval_scope(agent_id="agent-001"):
+        graph_db(cypher="MATCH (s:Service) RETURN s")
+        retrieval = current_retrievals()[0]
+        tasks = [message for message in Flowcept.buffer if message.get("subtype") == "agent_tool"]
+
+    assert retrieval.query_method == "cypher"
+    assert retrieval.query == "MATCH (s:Service) RETURN s"
+    assert tasks[-1]["used"]["query_method"] == "cypher"
+    assert retrieval.to_dict()["query_method"] == "cypher"

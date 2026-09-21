@@ -179,9 +179,11 @@ export function buildDecisionCandidates(tasks: Task[]): DecisionCandidates {
       const toolName = labelValue(retrieval.tool_name, "tool");
       const toolNodeId = `tool:${labelValue(retrieval.retrieval_id, toolName)}`;
       const retrievedRows = asRecords(retrieval.retrieved);
-      const toolBadges = [asString(retrieval.tool_type), `${retrievedRows.length} retrieved`].filter(
-        (badge): badge is string => Boolean(badge),
-      );
+      const toolBadges = [
+        asString(retrieval.tool_type),
+        asString(retrieval.query_method),
+        `${retrievedRows.length} retrieved`,
+      ].filter((badge): badge is string => Boolean(badge));
       const truncation = asRecord(retrieval.truncation);
       if (Object.keys(truncation).length) toolBadges.push("result capped");
       addNode({
@@ -210,6 +212,8 @@ export function buildDecisionCandidates(tasks: Task[]): DecisionCandidates {
         const content = previewText(item.content ?? summarize(item.content));
         const badges = [
           role,
+          // Which alternative this item bore on, when the agent said so.
+          verdict.candidate_id ? `for ${asString(verdict.candidate_id)}` : undefined,
           asString(item.source),
           item.score === undefined || item.score === null ? undefined : `score ${String(item.score)}`,
         ].filter((badge): badge is string => Boolean(badge));

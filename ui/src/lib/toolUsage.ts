@@ -7,6 +7,7 @@ export interface ToolUsageRow {
   task_id: string;
   tool_name: string;
   tool_type?: string;
+  query_method?: string;
   agent_id?: string;
   query_preview: string;
   query: unknown;
@@ -55,6 +56,7 @@ export function getToolUsageRows(tasks: Task[]): ToolUsageRow[] {
         // Older captures carry the tool name only in activity_id.
         tool_name: asString(used.tool_name) ?? asString(metadata.tool_name) ?? task.activity_id ?? "tool",
         tool_type: asString(used.tool_type) ?? asString(metadata.tool_type),
+        query_method: asString(used.query_method) ?? asString(metadata.query_method),
         agent_id: task.agent_id,
         query_preview: preview(used.query),
         query: used.query,

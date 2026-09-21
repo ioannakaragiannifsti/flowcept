@@ -57,6 +57,11 @@ class Retrieval:
     tool_name: str
     query: Any
     tool_type: str = "other"
+    # How the query was expressed, when the tool type alone does not say it: "sql",
+    # "cypher", "sparql", "vector_similarity", "keyword", "http_get", "graphql". Free text,
+    # because the set of retrieval languages is open, but recorded explicitly so a query
+    # can be interpreted later without guessing from its syntax.
+    query_method: str | None = None
     items: list[RetrievedItem] = field(default_factory=list)
     tool_args: dict = field(default_factory=dict)
     # Set when result-size limits dropped items or shortened their content. Recording it
@@ -88,6 +93,7 @@ class Retrieval:
             "retrieval_id": self.retrieval_id,
             "tool_name": self.tool_name,
             "tool_type": self.tool_type,
+            "query_method": self.query_method,
             "query": self.query,
             "tool_args": self.tool_args,
             "retrieved": [item.to_dict() for item in self.items],

@@ -38,7 +38,51 @@ from flowcept.instrumentation.task_capture import FlowceptTask
 # are tried in order, so a result carrying both "id" and "url" is keyed by "id".
 ID_FIELDS = ("item_id", "id", "_id", "doc_id", "document_id", "uri", "url", "key", "name", "title", "path")
 SOURCE_FIELDS = ("source", "url", "uri", "path", "link", "href")
-SCORE_FIELDS = ("score", "relevance", "relevance_score", "similarity", "rank_score", "distance")
+# "_score" is Elasticsearch/OpenSearch; "distance" is the vector stores, where smaller is
+# closer rather than better, which is why it is recorded as given and not inverted.
+SCORE_FIELDS = ("score", "_score", "relevance", "relevance_score", "similarity", "rank_score", "distance")
+
+# Keys under which search backends nest their actual result list. Unwrapping recurses,
+# because responses like Elasticsearch's {"hits": {"hits": [...]}} and SPARQL's
+# {"results": {"bindings": [...]}} bury the list more than one level down.
+RESULT_LIST_KEYS = (
+    "results",
+    "items",
+    "documents",
+    "docs",
+    "data",
+    "hits",
+    "rows",
+    "matches",
+    "bindings",
+    "records",
+    "nodes",
+    "chunks",
+    "passages",
+)
+_MAX_UNWRAP_DEPTH = 5
+
+# Fields whose presence means a dict is one result rather than a mapping of many.
+RECORD_HINT_FIELDS = (
+    set(ID_FIELDS)
+    | set(SOURCE_FIELDS)
+    | set(SCORE_FIELDS)
+    | {"content", "text", "body", "snippet", "metadata", "page_content", "_source", "payload"}
+)
+
+# Column-oriented backends (Chroma, Weaviate and similar) return parallel arrays rather
+# than a list of records. These names map a column back onto the per-item field it holds.
+COLUMN_ALIASES = {
+    "ids": "id",
+    "documents": "content",
+    "texts": "content",
+    "contents": "content",
+    "metadatas": "metadata",
+    "distances": "distance",
+    "scores": "score",
+    "sources": "source",
+    "uris": "uri",
+}
 
 # Record-side result limits, off by default: provenance keeps everything a tool returned.
 # What the model is shown is budgeted separately, by DecisionCapture, so a complete record
@@ -118,24 +162,91 @@ def _first_field(record: dict, fields: tuple[str, ...]):
     return None, None
 
 
-def _as_records(result: Any) -> list:
-    """Unwrap the shapes tools return into a flat list of results.
+def _is_dataframe(value: Any) -> bool:
+    """Detect a pandas-like table without importing pandas."""
+    return hasattr(value, "to_dict") and hasattr(value, "columns") and hasattr(value, "index")
 
-    Tools return a list, a payload wrapping a list under a key like ``results`` or
-    ``documents``, a mapping of id to content, or a single object. Everything else is
-    treated as one result rather than being dropped.
+
+def _columns_to_records(payload: dict) -> list | None:
+    """Turn parallel arrays into one record per position, or return None if not that shape.
+
+    Chroma and friends answer with ``{"ids": [[...]], "documents": [[...]]}``: the columns
+    are aligned by index, and one extra level of nesting holds the batch of queries. Zipped
+    back together each position becomes a normal record.
+    """
+    if len(payload) < 2:
+        return None
+
+    columns = {}
+    for key, value in payload.items():
+        if not isinstance(value, (list, tuple)):
+            return None
+        values = list(value)
+        # A batched response nests one list per query; a single query is the common case.
+        if len(values) == 1 and isinstance(values[0], (list, tuple)):
+            values = list(values[0])
+        columns[COLUMN_ALIASES.get(key, key)] = values
+
+    lengths = {len(values) for values in columns.values()}
+    if len(lengths) != 1 or lengths == {0}:
+        return None
+
+    count = lengths.pop()
+    return [{key: values[index] for key, values in columns.items()} for index in range(count)]
+
+
+def _as_records(result: Any, depth: int = 0) -> list:
+    """Unwrap the shapes retrieval backends return into a flat list of results.
+
+    Handles a plain list, a response nesting its list under a key like ``hits`` or
+    ``bindings`` at any depth, column-oriented arrays, a pandas table, a mapping of id to
+    content, and a single object. Anything unrecognized is treated as one result rather
+    than being dropped.
     """
     if result is None:
         return []
     if isinstance(result, RetrievedItem):
         return [result]
+    if _is_dataframe(result):
+        # One item per row, not one item holding the whole table.
+        try:
+            return list(result.to_dict("records"))
+        except Exception:  # noqa: BLE001 - an exotic table still must not lose its results
+            return [result]
     if isinstance(result, dict):
-        for key in ("results", "items", "documents", "docs", "data", "hits", "rows", "matches"):
-            nested = result.get(key)
-            if isinstance(nested, (list, tuple)):
-                return list(nested)
-        # A mapping of identifier to payload, e.g. {"doc-1": "...", "doc-2": "..."}.
-        if result and all(isinstance(key, str) for key in result):
+        # Column-oriented first: a vector store's {"ids": [...], "documents": [...]} also
+        # contains a key named in RESULT_LIST_KEYS, and unwrapping that would hand back one
+        # column instead of the zipped records.
+        columns = _columns_to_records(result)
+        if columns is not None:
+            return columns
+
+        if depth < _MAX_UNWRAP_DEPTH:
+            for key in RESULT_LIST_KEYS:
+                if key not in result:
+                    continue
+                nested = result[key]
+                if isinstance(nested, (list, tuple)):
+                    return list(nested)
+                # e.g. Elasticsearch {"hits": {"hits": [...]}}, SPARQL {"results": {...}}.
+                if isinstance(nested, dict):
+                    unwrapped = _as_records(nested, depth + 1)
+                    if unwrapped != [nested]:
+                        return unwrapped
+
+            # An envelope whose key this does not know, such as Solr's {"response": {...}}.
+            # A single-entry wrapper carries no data of its own, so descend into it.
+            if len(result) == 1:
+                only = next(iter(result.values()))
+                if isinstance(only, (dict, list, tuple)):
+                    unwrapped = _as_records(only, depth + 1)
+                    if unwrapped != [only]:
+                        return unwrapped
+
+        # A mapping of identifier to payload, e.g. {"doc-1": "...", "doc-2": "..."}. Only
+        # when the dict carries none of the fields a single record would: otherwise a lone
+        # result like {"id": ..., "content": ...} would be split into one item per field.
+        if result and all(isinstance(key, str) for key in result) and not (set(result) & RECORD_HINT_FIELDS):
             return [{"item_id": key, "content": value} for key, value in result.items()]
         return [result]
     if isinstance(result, (list, tuple, set)):
@@ -168,8 +279,9 @@ def _to_item(record: Any, index: int) -> RetrievedItem:
         source_field, source = _first_field(payload, SOURCE_FIELDS)
         score_field, score = _first_field(payload, SCORE_FIELDS)
         # The id stays in the content too: dropping it would make the recorded result
-        # differ from what the tool actually returned.
-        content = payload.get("content", payload)
+        # differ from what the tool actually returned. `_source` is Elasticsearch's
+        # document body, and `page_content` the LangChain convention.
+        content = payload.get("content", payload.get("_source", payload.get("page_content", payload)))
         try:
             score_value = float(score) if score is not None else None
         except (TypeError, ValueError):
@@ -304,6 +416,7 @@ def record_retrieval(
         used={
             "tool_name": retrieval.tool_name,
             "tool_type": retrieval.tool_type,
+            "query_method": retrieval.query_method,
             "query": retrieval.query,
             "tool_args": retrieval.tool_args,
         },
@@ -311,6 +424,7 @@ def record_retrieval(
             "retrieval_id": retrieval.retrieval_id,
             "tool_name": retrieval.tool_name,
             "tool_type": retrieval.tool_type,
+            "query_method": retrieval.query_method,
             "schema_version": retrieval.schema_version,
         },
         capture_telemetry=False,
@@ -345,6 +459,7 @@ class ToolCapture:
         tool_name: str,
         query,
         tool_type: str = "other",
+        query_method: str | None = None,
         tool_args: dict | None = None,
         agent_id: str | None = None,
         workflow_id: str | None = None,
@@ -356,6 +471,7 @@ class ToolCapture:
         self.tool_name = tool_name
         self.query = query
         self.tool_type = tool_type
+        self.query_method = query_method
         self.tool_args = tool_args or {}
         self.max_items = max_items
         self.max_item_chars = max_item_chars
@@ -433,6 +549,7 @@ class ToolCapture:
         self.retrieval = Retrieval(
             tool_name=self.tool_name,
             tool_type=self.tool_type,
+            query_method=self.query_method,
             query=self.query,
             tool_args=self.tool_args,
             items=items,
@@ -467,6 +584,7 @@ def flowcept_tool(
     *,
     tool_name: str | None = None,
     tool_type: str = "other",
+    query_method: str | None = None,
     query_arg: str | None = None,
     agent_id: str | None = None,
     workflow_id: str | None = None,
@@ -517,6 +635,7 @@ def flowcept_tool(
                 tool_name or getattr(target, "__name__", "tool"),
                 query=_derive_query(args, kwargs, query_arg),
                 tool_type=tool_type,
+                query_method=query_method,
                 tool_args=kwargs,
                 agent_id=agent_id,
                 workflow_id=workflow_id,
@@ -591,12 +710,14 @@ class FlowceptTool:
         tool,
         tool_type: str = "other",
         tool_name: str | None = None,
+        query_method: str | None = None,
         agent_id: str | None = None,
         workflow_id: str | None = None,
         parent_task_id: str | None = None,
     ):
         self.tool = tool
         self.tool_type = tool_type
+        self.query_method = query_method
         self.tool_name = tool_name or getattr(tool, "name", None) or type(tool).__name__
         self.agent_id = agent_id
         self.workflow_id = workflow_id
@@ -617,6 +738,7 @@ class FlowceptTool:
             self.tool_name,
             query=tool_input.get("query", tool_input) if isinstance(tool_input, dict) else tool_input,
             tool_type=self.tool_type,
+            query_method=self.query_method,
             tool_args=tool_input if isinstance(tool_input, dict) else {"input": tool_input},
             agent_id=self.agent_id,
             workflow_id=self.workflow_id,

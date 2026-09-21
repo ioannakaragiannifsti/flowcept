@@ -572,6 +572,12 @@ const TOOL_USAGE_COLS: ColumnDef<ToolUsageRow, any>[] = [
     cell: ({ row }) => <span className="text-fg-muted">{row.original.tool_type ?? "—"}</span>,
   },
   {
+    id: "query_method",
+    header: "Method",
+    size: 110,
+    cell: ({ row }) => <span className="text-fg-muted">{row.original.query_method ?? "—"}</span>,
+  },
+  {
     id: "agent_id",
     header: "Agent",
     size: 160,

@@ -70,7 +70,21 @@ with retrieval_scope(agent_id="planner", workflow_id=workflow_id, parent_task_id
     record.grounding_summary()  # tools_used, retrieved_count, kept_item_ids, dropped_item_ids
 ```
 
-`normalize_retrieved_items` turns whatever the tool returned into retrieved items: lists of dicts (identity taken from `item_id`/`id`/`url`/… , plus `source` and `score` when present), payloads wrapping a list under `results`/`documents`/`rows`/…, id-to-content mappings, database rows, LangChain documents, and plain scalars. A result with no usable identifier gets one derived from its content, and duplicates are suffixed, so every item stays individually addressable by the verdicts a decision reports against it. A tool that raises records nothing — a failed call has no trustworthy result set.
+`normalize_retrieved_items` turns whatever the tool returned into retrieved items, whichever retrieval system produced it:
+
+| Source | Shape handled |
+| --- | --- |
+| SQL / Mongo / Neo4j | lists of dicts or rows; identity from `item_id`/`id`/`_id`/`url`/… |
+| Elasticsearch / OpenSearch | `{"hits": {"hits": [...]}}`, with `_id`, `_score` and `_source` as the body |
+| Solr and other envelopes | any single-key wrapper, e.g. `{"response": {"docs": [...]}}` |
+| SPARQL | `{"results": {"bindings": [...]}}` |
+| Chroma / Weaviate | column-oriented `{"ids": [[...]], "documents": [[...]], "distances": [[...]]}`, zipped back into records |
+| Pinecone / Qdrant | `{"matches": [...]}` / `{"result": [...]}` with `score` |
+| Web search | lists of dicts keyed by `url`, with `source` taken from it |
+| pandas | one item per row, not one item per table |
+| LangChain | `Document.page_content` plus `metadata` |
+
+Also handles id-to-content mappings, plain scalars, and a single record (which is kept as one item rather than split per field). A result with no usable identifier gets one derived from its content, and duplicates are suffixed, so every item stays individually addressable by the verdicts a decision reports against it. `query_method` records *how* the agent searched — `"sql"`, `"cypher"`, `"sparql"`, `"vector_similarity"`, `"keyword"`, `"http_get"` — so a recorded query can be interpreted later without inferring it from syntax. A tool that raises records nothing — a failed call has no trustworthy result set.
 
 Scopes are context-local, so concurrent agents keep their own; retrievals never leak between agent turns. `FlowceptTool(tool, tool_type=...)` wraps a LangChain `BaseTool` the same way (`invoke`/`run`/`ainvoke`/`arun`), mirroring `FlowceptLLM` for models. `ToolCapture` remains for callers that add results explicitly.
 
@@ -81,6 +95,7 @@ Scopes are context-local, so concurrent agents keep their own; retrievals never 
 - **Tools dispatched to another thread** do not see the scope — `contextvars` do not cross `threading.Thread` — so their retrieval would be published unattributed and never reach the decision. Wrap the callable at submission time with `propagate_scope(tool)`, on the thread that owns the scope, or pass `agent_id=`/`workflow_id=` to `@flowcept_tool`. A capture that finds neither a scope nor an `agent_id` logs a warning rather than failing quietly.
 - **Framework-internal dispatch** (LangGraph `ToolNode`, CrewAI, AutoGen) only captures if the wrapped callable is the one registered with the framework.
 - **Action tools** — send an email, write a file, run code — are captured correctly as `agent_tool` tasks, but "kept vs dropped evidence" is meaningless for them. Keep them out of the decision's retrievals (call them outside the scope, or pass `retrievals=[]`).
+
 ### Result size: what is stored vs what the model sees
 
 These are two different budgets and they are set independently.
@@ -91,7 +106,7 @@ These are two different budgets and they are set independently.
 
 ### What the decision records
 
-Retrievals switch `invoke()` to the `GroundedDecisionResponse` contract: the retrieved items go into the prompt with their `item_id`s, and the model must return an `evidence_uses` entry for each one saying whether it kept the item (`used`), why (`role` from `supporting`, `contradicting`, `irrelevant`, `redundant`, `unreliable`), and a one-sentence explanation. An `item_id` the model invents is rejected, so the grounding trail cannot claim evidence no tool returned.
+Retrievals switch `invoke()` to the `GroundedDecisionResponse` contract: the retrieved items go into the prompt with their `item_id`s, and the model must return an `evidence_uses` entry for each one saying whether it kept the item (`used`), why (`role` from `supporting`, `contradicting`, `irrelevant`, `redundant`, `unreliable`), and a one-sentence explanation. An `item_id` the model invents is rejected, so the grounding trail cannot claim evidence no tool returned. Each verdict may also name a `candidate_id`, which is what turns the record into a per-alternative account: which evidence supported the alternative that was chosen, and which supported the ones rejected.
 
 The stored decision task carries, in one record: `retrievals` (the unfiltered results), `evidence_uses` (kept versus dropped, with reasons), and the usual `candidates`, `assessments`, and `selected_candidate_ids`. `custom_metadata.grounding` holds the summary counts, and `used.retrieval_ids` links the decision back to the `agent_tool` tasks that produced its evidence. Manual capture uses the same fields through `capture.add_retrieval()` and `capture.use_evidence()`.
 
