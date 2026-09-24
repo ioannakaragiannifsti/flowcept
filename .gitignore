@@ -25,6 +25,7 @@ test.py
 time.txt
 tmp/
 deployment/data
+data/project_team/team_selection.db
 **/*output_data*
 examples/llm_complex/input_data
 tmp_tests/
