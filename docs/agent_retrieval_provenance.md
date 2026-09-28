@@ -1,7 +1,12 @@
-# Agent Retrieval & Decision Provenance
+# Agent Decision & Retrieval Provenance
 
 How Flowcept records what an agent searched for, what came back, what it kept, and what it
 decided — and how to read the result.
+
+The two halves are independent. **Decision capture** works on its own for any agent that
+chooses between alternatives, with or without tools. **Retrieval capture** adds the evidence
+layer underneath it. Sections 2–5 mark which half each part belongs to, so an agent that
+uses no tools can be documented by the decision parts alone.
 
 ---
 
@@ -42,7 +47,7 @@ narrative answer.
 
 ## 2. Data model
 
-### `RetrievedItem` — one result
+### `RetrievedItem` — one result *(retrieval half)*
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -53,7 +58,7 @@ narrative answer.
 | `score` | float? | Relevance or distance, **as the backend reported it** — a distance is not inverted into a similarity, because that would be a guess. |
 | `metadata` | dict | Backend extras, plus truncation markers when applicable. |
 
-### `Retrieval` — one tool call
+### `Retrieval` — one tool call *(retrieval half)*
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -66,7 +71,7 @@ narrative answer.
 | `truncation` | dict | Empty unless size limits cut something; see §7. |
 | `retrieval_id` | uuid | Links the decision back to this tool call. |
 
-### `EvidenceUse` — one verdict
+### `EvidenceUse` — one verdict *(links the two halves)*
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -82,10 +87,41 @@ that pair is self-contradictory and inflates the kept count. `contradicting` **i
 with `used: true`: evidence arguing against the chosen option is still evidence that was
 used.
 
+### `Candidate` — one alternative that was considered *(decision half)*
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `candidate_id` | str | Identifier assessments and selections reference. |
+| `status` | str | `proposed`, `selected`, `rejected` or `filtered`. Set for you by `select()`. |
+| `content` | any | What the alternative was. |
+| `content_ref` | str? | A pointer instead of inline content, for a candidate too large to embed. Mutually exclusive with `content`. |
+| `origin_type` | str | How it arose; defaults to `explicit_generation`. |
+| `rank` | int? | Position, when the generator ordered them. |
+
+Recording rejected alternatives is the point: an answer alone never shows what else was on
+the table. A `filtered` status marks a candidate removed before it was ever assessed.
+
+### `Assessment` — one evaluation of one candidate *(decision half)*
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `candidate_id` | str | Which alternative this judges. |
+| `evaluator_id` | str | Who judged — a model, an agent, a rule, or a human. |
+| `score_type` | str | What the number means, e.g. `model_reported_confidence`. Required, because a bare score is uninterpretable. |
+| `score` | float? | The value, on whatever scale `score_type` names. |
+| `explanation` | str? | Why. |
+| `criteria` | list[str] | What was weighed. |
+| `evidence_ids` | list[str] | Entities or retrieved items this rests on. |
+| `assessment_id` | uuid | Generated. |
+
+Several evaluators may assess the same candidate; each is its own `Assessment`, so a
+disagreement between a model and a human reviewer is preserved rather than collapsed.
+
 ### `DecisionRecord` — the decision
 
-Existing fields (`decision_type`, `context`, `candidates`, `assessments`,
-`selected_candidate_ids`, `input_entity_ids`, `output_entity_ids`) plus:
+Fields: `decision_type`, `context`, `candidates`, `assessments`, `selected_candidate_ids`,
+`input_entity_ids`, `output_entity_ids`, `decision_id`, `timestamp`, `schema_version` — plus
+the retrieval half:
 
 - `retrievals` — the full ground truth, embedded in the record so it survives independently.
 - `evidence_uses` — the verdicts.
@@ -112,7 +148,7 @@ cannot claim evidence that never existed.
 
 ## 3. Capture APIs
 
-### `@flowcept_tool` — the normal path
+### `@flowcept_tool` — the normal path *(retrieval half)*
 
 Decorate a tool function you already have. It runs untouched and **its return value is
 passed through unchanged**, so existing agent code is unaffected.
@@ -126,7 +162,7 @@ def ops_database(sql: str) -> list[dict]:
 The query is taken from `query_arg`, or a keyword named `query`/`q`/`question`/`sql`/…, or
 the first positional argument.
 
-### `retrieval_scope` — how a decision finds its evidence
+### `retrieval_scope` — how a decision finds its evidence *(retrieval half)*
 
 ```python
 with retrieval_scope(agent_id="planner", workflow_id=wf_id, parent_task_id=agent_task_id):
@@ -143,18 +179,60 @@ opening one scope per agent turn** — nothing is threaded through the call stac
 
 Scopes are context-local, so concurrent agents keep their own.
 
-### `DecisionCapture` — the decision
+### `DecisionCapture` — model-driven *(decision half; works without tools)*
 
-With retrievals present, `invoke()` switches from the plain contract to
-`GroundedDecisionResponse`: the retrieved items enter the prompt carrying their `item_id`s,
-and the JSON schema makes an `evidence_uses` entry for **every** item mandatory, discarded
-ones included.
+Attach a model and call `invoke()`. The capture owns the prompt, enforces the output
+contract, and publishes both the model invocation and the decision:
 
-Without retrievals (an agent that used no tools) it falls back to the plain contract and
-records no verdicts. Both produce the same kind of record.
+```python
+with Flowcept(), DecisionCapture(
+    decision_type="severity_triage",
+    context={"question": "Which severity fits?"},
+    agent_id="triage-agent",
+    llm=model,
+) as capture:
+    record = capture.invoke("Classify this incident.")
 
-Manual use is also supported: `add_retrieval()`, `use_evidence()`, `add_candidate()`,
-`assess()`, `select()`.
+record.selected_candidate_ids      # ['high']
+record.candidates                  # every alternative, with status
+record.assessments                 # score + explanation + criteria per candidate
+```
+
+**Two contracts, chosen automatically:**
+
+| Situation | Contract | Model must return |
+| --- | --- | --- |
+| No retrievals in scope | `DecisionResponse` | `candidates`, `assessments` (score in `[0,1]`, `criteria`, `explanation`), `selected_candidate_ids` |
+| Retrievals present | `GroundedDecisionResponse` | the same **plus** `evidence_uses` — one verdict per retrieved item, discarded ones included |
+
+Both validate that candidate ids are unique, that selections reference known candidates, and
+that every candidate is assessed. Identifiers, timestamps and evaluator attribution come
+from the runtime, never from the model, so a model cannot forge them.
+
+The model must support the OpenAI-compatible JSON-schema `response_format` parameter. Use a
+fresh `DecisionCapture` per decision; a capture holds exactly one.
+
+### Manual capture — when you already know the alternatives *(decision half)*
+
+For a rule, a human review step, or a decision made in code rather than by a model. Used as
+a context manager, the record is published on exit:
+
+```python
+with DecisionCapture(decision_type="selection", context="Pick a remediation",
+                     agent_id="planner") as decision:
+    decision.add_candidate("rollback", content="Revert the release")
+    decision.add_candidate("drain", content="Drain the queue")
+    decision.assess("rollback", evaluator_id="planner", score_type="reviewer_score",
+                    score=0.9, criteria=["reversible"], explanation="Safe to undo")
+    decision.select("rollback")          # sets status on every candidate
+```
+
+`select()` rejects unknown candidate ids, and marks everything not selected as `rejected`.
+Add `use_evidence()` and `add_retrieval()` to attach the retrieval half by hand.
+
+`record_decision(decision, agent_id=...)` publishes a `DecisionRecord` you built yourself and
+returns its task id — the lowest-level entry point, useful when the decision was made
+somewhere Flowcept was not present.
 
 ### Others
 
@@ -215,10 +293,36 @@ agent's internal deliberation is in the record, not only its conclusion.
     "retrieval_ids": ["…"],        // points back at the agent_tool tasks
     "queries": ["SELECT …"]
   },
-  "generated": { "decision": { /* the full DecisionRecord */ }, "output_entity_ids": [...] },
+  "generated": {
+    "decision": {
+      "decision_id": "…", "decision_type": "response_plan_selection", "schema_version": "0.1.0",
+      "context": {...},
+      "candidates": [
+        { "candidate_id": "rollback_config", "status": "selected",
+          "content": "Revert the email worker config", "origin_type": "explicit_generation" },
+        { "candidate_id": "drain_queue", "status": "rejected", "content": "Drain the queue" }
+      ],
+      "assessments": [
+        { "candidate_id": "rollback_config", "evaluator_id": "planner",
+          "score_type": "model_reported_confidence", "score": 0.86,
+          "criteria": ["addresses root cause", "reversible"],
+          "explanation": "Removes the bad credential", "assessment_id": "…" },
+        { "candidate_id": "drain_queue", "evaluator_id": "planner",
+          "score_type": "model_reported_confidence", "score": 0.25,
+          "criteria": ["addresses root cause"], "explanation": "Drains symptoms only" }
+      ],
+      "selected_candidate_ids": ["rollback_config"],
+      "retrievals": [ /* the retrieval half; absent when no tools were used */ ],
+      "evidence_uses": [ /* the retrieval half */ ]
+    },
+    "output_entity_ids": [...]
+  },
   "custom_metadata": { "decision_id": "…", "decision_type": "…", "grounding": { /* summary */ } }
 }
 ```
+
+An agent that used no tools produces exactly this, minus `retrievals` and `evidence_uses`.
+That is the whole difference between the two halves at storage level.
 
 Tasks are linked by `parent_task_id`: agent span → tool calls and model calls → decision.
 
@@ -391,8 +495,14 @@ existing `FlowceptTask` → interceptor → Redis → `DocumentInserter` → Mon
 `instrumentation/agent_provenance_fsti/tool_provenance.py`, `instrumentation/agent_provenance_fsti/decision_provenance.py`,
 `instrumentation/agent_provenance_fsti/decision_response.py`.
 
-**Examples** — `examples/tool_provenance_example.py` (no model or services needed),
-`examples/local_llm_tool_grounded_example.py` (four agents, real tool calls, local Qwen).
+**Examples**, all under `examples/decision_examples/`:
+
+| Example | Shows |
+| --- | --- |
+| `decision_provenance_example.py` | decision capture alone, no tools |
+| `decision_provenance_mas.py` | a multi-agent system with decision handoffs |
+| `tool_provenance_example.py` | tool capture + grounding, no model or services needed |
+| `local_llm_tool_grounded_example.py` | four agents, real tool calls, local Qwen; `--capture-mode baseline` reruns it with both halves switched off, for comparison |
 
 **Tests** — `tests/instrumentation_tests/tool_capture_auto_test.py`,
 `tool_provenance_test.py`, `decision_provenance_test.py`.
