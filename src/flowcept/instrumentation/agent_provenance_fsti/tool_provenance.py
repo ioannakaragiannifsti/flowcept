@@ -1,5 +1,8 @@
 """Capture agent tool calls and what they retrieved through Flowcept tasks.
 
+Added at Ferdinand-Steinbeis-Institut as part of the agent retrieval-provenance extension;
+not part of upstream Flowcept. See ``docs/agent_retrieval_provenance.md``.
+
 Three ways in, in increasing order of automation:
 
 - :class:`ToolCapture` -- a context manager, when the caller wants to add each result
@@ -10,7 +13,7 @@ Three ways in, in increasing order of automation:
 - :class:`FlowceptTool` -- the same, for a LangChain ``BaseTool``.
 
 With :func:`retrieval_scope` open, every retrieval captured inside it is collected, and a
-:class:`~flowcept.instrumentation.decision_provenance.DecisionCapture` created in that
+:class:`~flowcept.instrumentation.agent_provenance_fsti.decision_provenance.DecisionCapture` created in that
 scope picks them up on its own. A multi-agent system therefore gets grounded decisions by
 decorating its tools and opening one scope per agent turn, without passing retrievals
 around by hand.
@@ -26,7 +29,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any
 
-from flowcept.commons.flowcept_dataclasses.retrieval_provenance import (
+from flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.retrieval_provenance import (
     Retrieval,
     RetrievedItem,
 )
@@ -616,7 +619,7 @@ def flowcept_tool(
         Recorded tool name. Defaults to the function's name.
     tool_type : str
         One of the values in
-        :data:`~flowcept.commons.flowcept_dataclasses.retrieval_provenance.TOOL_TYPES`.
+        :data:`~flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.retrieval_provenance.TOOL_TYPES`.
     query_arg : str, optional
         Name of the keyword argument holding the query. By default the first positional
         argument, or a keyword named ``query``/``q``/``question``/``sql`` and similar, is

@@ -1,11 +1,15 @@
-"""Domain-agnostic decision provenance data models."""
+"""Domain-agnostic decision provenance data models.
+
+Added at Ferdinand-Steinbeis-Institut as part of the agent decision-provenance extension;
+not part of upstream Flowcept. See ``docs/agent_retrieval_provenance.md``.
+"""
 
 from dataclasses import asdict, dataclass, field
 from time import time
 from typing import Any
 from uuid import uuid4
 
-from flowcept.commons.flowcept_dataclasses.retrieval_provenance import (
+from flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.retrieval_provenance import (
     EvidenceUse,
     Retrieval,
 )

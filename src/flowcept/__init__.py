@@ -79,7 +79,7 @@ def __getattr__(name):
         return SETTINGS_PATH
 
     elif name in {"Candidate", "Assessment", "DecisionRecord"}:
-        from flowcept.commons.flowcept_dataclasses.decision_provenance import (
+        from flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.decision_provenance import (
             Assessment,
             Candidate,
             DecisionRecord,
@@ -92,7 +92,7 @@ def __getattr__(name):
         }[name]
 
     elif name in {"Retrieval", "RetrievedItem", "EvidenceUse"}:
-        from flowcept.commons.flowcept_dataclasses.retrieval_provenance import (
+        from flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.retrieval_provenance import (
             EvidenceUse,
             Retrieval,
             RetrievedItem,
@@ -115,15 +115,15 @@ def __getattr__(name):
         "propagate_scope",
         "materialize",
     }:
-        from flowcept.instrumentation import tool_provenance
+        from flowcept.instrumentation.agent_provenance_fsti import tool_provenance
 
         return getattr(tool_provenance, name)
     elif name == "record_decision":
-        from flowcept.instrumentation.decision_provenance import record_decision
+        from flowcept.instrumentation.agent_provenance_fsti.decision_provenance import record_decision
 
         return record_decision
     elif name == "DecisionCapture":
-        from flowcept.instrumentation.decision_provenance import DecisionCapture
+        from flowcept.instrumentation.agent_provenance_fsti.decision_provenance import DecisionCapture
 
         return DecisionCapture
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

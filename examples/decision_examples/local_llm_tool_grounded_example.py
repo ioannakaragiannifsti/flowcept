@@ -71,7 +71,7 @@ Needs Ollama with a tool-capable model, plus Redis and MongoDB for persistence::
 
     ollama pull qwen3:4b
     $env:FLOWCEPT_SETTINGS_PATH = "agent_sandbox\settings.yaml"
-    .\.venv\Scripts\python.exe examples\local_llm_tool_grounded_example.py --model qwen3:4b
+    .\.venv\Scripts\python.exe examples\decision_examples\local_llm_tool_grounded_example.py --model qwen3:4b
 
 Add ``--web-search`` for a live DuckDuckGo search alongside the local tools, and
 ``--no-trace`` for just the summary.
@@ -110,12 +110,15 @@ COMMANDER_CANDIDATES = ("execute", "modify", "reject")
 
 MAX_TOKENS = 2400
 TOP_K = 5
-DATA_DIR = Path(__file__).parent / "data"
+# Anchored on the examples/ directory, which is where the shared data sets live, so this
+# example keeps working from any sub-directory it is filed under.
+EXAMPLES_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = EXAMPLES_DIR / "data"
 
-# Every run is saved here by default, named after its workflow id. Resolved from this
-# file rather than the working directory, so runs land in one place no matter where the
-# command was issued.
-DEFAULT_OUT_DIR = Path(__file__).parent.parent / "runs"
+# Every run is saved here by default, named after its workflow id. Anchored on the
+# repository root rather than the working directory, so runs land in one place no matter
+# where the command was issued from.
+DEFAULT_OUT_DIR = EXAMPLES_DIR.parent / "runs"
 
 TABLE_SCHEMA = (
     "ops_records(id TEXT, kind TEXT, service TEXT, title TEXT, body TEXT, recorded_at TEXT). "
@@ -193,10 +196,23 @@ def open_ops_database(sql_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def make_tools(connection: sqlite3.Connection, kb_dir: Path, enable_web: bool) -> dict:
+def _tool(capture: bool, **decorator_kwargs):
+    """Apply Flowcept's tool capture, or leave the function untouched in baseline mode.
+
+    The tool body, its arguments and its results are identical either way; only whether the
+    call is recorded changes. That is what makes the two modes a controlled comparison.
+    """
+
+    def decorator(func):
+        return flowcept_tool(**decorator_kwargs)(func) if capture else func
+
+    return decorator
+
+
+def make_tools(connection: sqlite3.Connection, kb_dir: Path, enable_web: bool, capture: bool = True) -> dict:
     """Build the executable tools, each closing over its real data source."""
 
-    @flowcept_tool(tool_name="ops_database", tool_type="database", query_arg="sql")
+    @_tool(capture, tool_name="ops_database", tool_type="database", query_method="sql", query_arg="sql")
     def ops_database(sql: str) -> list[dict]:
         """Execute the agent's SQL against the operations store."""
         statement = sql.strip().rstrip(";").strip()
@@ -216,7 +232,7 @@ def make_tools(connection: sqlite3.Connection, kb_dir: Path, enable_web: bool) -
             return [{"id": "tool-error:sql-error", "content": f"SQL error: {error}. Statement: {statement!r}"}]
         return rows
 
-    @flowcept_tool(tool_name="knowledge_base", tool_type="vector_store", query_arg="keywords")
+    @_tool(capture, tool_name="knowledge_base", tool_type="vector_store", query_method="keyword", query_arg="keywords")
     def knowledge_base(keywords: str) -> list[dict]:
         """Rank knowledge-base documents by how well they match the agent's keywords."""
         terms = _terms(keywords)
@@ -248,7 +264,9 @@ def make_tools(connection: sqlite3.Connection, kb_dir: Path, enable_web: bool) -
 
     if enable_web:
 
-        @flowcept_tool(tool_name="web_search", tool_type="web_search", query_arg="search_terms")
+        @_tool(
+            capture, tool_name="web_search", tool_type="web_search", query_method="http_get", query_arg="search_terms"
+        )
         def web_search(search_terms: str) -> list[dict]:
             """Search the live web through DuckDuckGo's HTML endpoint."""
             import requests
@@ -304,8 +322,10 @@ def gather_evidence(llm, tools: dict, allowed: list[str], instruction: str, cont
     SQL statement a recoverable step rather than a dead end. Every attempt, including the
     failed one, is captured as its own ``agent_tool`` task.
 
-    Returns one entry per executed call, for the console summary only; the authoritative
-    record is the tasks those calls published.
+    Returns one entry per executed call plus the raw rows each returned. In extended mode
+    the rows are redundant -- the retrieval scope already holds them -- but baseline mode
+    has no scope, so the caller must put them into the prompt itself, which is exactly what
+    a pipeline without retrieval provenance has to do.
     """
     planner = FlowceptLLM(
         llm.bind_tools([SCHEMAS[name] for name in allowed]),
@@ -329,6 +349,7 @@ def gather_evidence(llm, tools: dict, allowed: list[str], instruction: str, cont
     ]
 
     executed: list[dict] = []
+    retrieved: list[dict] = []
     for attempt in range(2):
         response = planner.invoke(messages)
         calls = getattr(response, "tool_calls", None) or []
@@ -344,6 +365,7 @@ def gather_evidence(llm, tools: dict, allowed: list[str], instruction: str, cont
                 continue
             results = function(**{argument: value})
             entry = {"tool": name, argument: value, "returned": len(results or [])}
+            retrieved.extend(results or [])
             if _is_failure(results):
                 entry["failed"] = True
                 failures.append(f"{name}({argument}={value!r}) -> {json.dumps(results, default=str)[:400]}")
@@ -373,8 +395,9 @@ def gather_evidence(llm, tools: dict, allowed: list[str], instruction: str, cont
             function, argument = fallback
             terms = " ".join(_terms(instruction)[:8])
             results = function(**{argument: terms})
+            retrieved.extend(results or [])
             executed.append({"tool": "KnowledgeBaseQuery", argument: terms, "returned": len(results), "fallback": True})
-    return executed
+    return executed, retrieved
 
 
 # ---------------------------------------------------------------------------
@@ -477,8 +500,15 @@ def run_agent(
     decision_question: str,
     parent_task_id: str | None = None,
     fixed_candidates: tuple[str, ...] | None = None,
+    capture_provenance: bool = True,
 ):
-    """Run one agent: choose tools, execute them, then decide from what they returned."""
+    """Run one agent: choose tools, execute them, then decide from what they returned.
+
+    With ``capture_provenance=False`` the agent does the same work with the same tools and
+    the same model, but without this extension: no ``agent_tool`` tasks, no decision record,
+    and the retrieved rows are pasted into the prompt instead of being carried by a
+    retrieval scope. The answer is then whatever prose the model returns.
+    """
     with FlowceptTask(
         # No subtype on the agent's own span: `agent_tool` means a real tool call, so
         # tagging the agent with it too would make the genuine tool tasks in this workflow
@@ -504,23 +534,55 @@ def run_agent(
             max_tokens=MAX_TOKENS,
         )
 
+        def call_tools():
+            """Run the agent's tool selection with this turn's attribution in scope."""
+            if not allowed_tools:
+                return [], []
+            tokens = [
+                llm_agent_id.set(agent_id),
+                llm_workflow_id.set(workflow_id),
+                llm_parent_task_id.set(agent_task.get_id()),
+            ]
+            try:
+                return gather_evidence(model, tools, allowed_tools, instruction, context_for_model)
+            finally:
+                llm_agent_id.reset(tokens[0])
+                llm_workflow_id.reset(tokens[1])
+                llm_parent_task_id.reset(tokens[2])
+
+        if not capture_provenance:
+            executed, retrieved = call_tools()
+            # No scope, no decision record. The evidence reaches the model only as prompt
+            # text, and the answer is free prose: nothing states which rows were used.
+            plain = FlowceptLLM(model, agent_id=agent_id, workflow_id=workflow_id, parent_task_id=agent_task.get_id())
+            answer = str(
+                plain.invoke(
+                    [
+                        {"role": "system", "content": f"You are {agent_role} in a production incident-response team."},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{instruction}\n\nCONTEXT:\n{json.dumps(context_for_model, indent=2, default=str)}"
+                                f"\n\nEVIDENCE:\n{json.dumps(retrieved, indent=2, default=str)}"
+                            ),
+                        },
+                    ]
+                )
+            )
+            agent_task.end(
+                generated={
+                    "response": answer,
+                    "tool_calls": executed,
+                    "output_entity_ids": [output_entity_id],
+                }
+            )
+            return answer, agent_task.get_id(), None, executed
+
         # Everything captured in this scope belongs to this agent turn: the tools inherit
         # the attribution, and the DecisionCapture below collects their retrievals without
         # being told about them.
         with retrieval_scope(agent_id=agent_id, workflow_id=workflow_id, parent_task_id=agent_task.get_id()):
-            executed = []
-            if allowed_tools:
-                tokens = [
-                    llm_agent_id.set(agent_id),
-                    llm_workflow_id.set(workflow_id),
-                    llm_parent_task_id.set(agent_task.get_id()),
-                ]
-                try:
-                    executed = gather_evidence(model, tools, allowed_tools, instruction, context_for_model)
-                finally:
-                    llm_agent_id.reset(tokens[0])
-                    llm_workflow_id.reset(tokens[1])
-                    llm_parent_task_id.reset(tokens[2])
+            executed, _ = call_tools()
 
             context = _decision_context(agent_role, decision_question, model_name, fixed_candidates)
 
@@ -563,17 +625,24 @@ def run_agent(
     return answer, agent_task.get_id(), record, executed
 
 
-def run_simulation(model_name: str, ops_db: Path, kb_dir: Path, enable_web: bool):
+def run_simulation(model_name: str, ops_db: Path, kb_dir: Path, enable_web: bool, capture_provenance: bool = True):
     """Run four collaborating local-model agents, three of which call real tools."""
     connection = open_ops_database(ops_db)
-    tools = make_tools(connection, kb_dir, enable_web)
+    tools = make_tools(connection, kb_dir, enable_web, capture=capture_provenance)
     investigation_tools = ["KnowledgeBaseQuery", "OpsDatabaseQuery"]
     if "WebSearchQuery" in tools:
         investigation_tools.append("WebSearchQuery")
 
+    mode = "extended" if capture_provenance else "baseline"
     with Flowcept(
-        workflow_name="Tool-Grounded Incident Response MAS",
-        workflow_args={"incident": INCIDENT, "model": model_name, "web_search": enable_web},
+        # The mode is in the name so the two runs are distinguishable in the UI at a glance.
+        workflow_name=f"Tool-Grounded Incident Response MAS ({mode})",
+        workflow_args={
+            "incident": INCIDENT,
+            "model": model_name,
+            "web_search": enable_web,
+            "capture_mode": mode,
+        },
         start_persistence=True,
         check_safe_stops=False,
     ) as flowcept:
@@ -596,6 +665,7 @@ def run_simulation(model_name: str, ops_db: Path, kb_dir: Path, enable_web: bool
                 "Which severity and urgency classification best fits this incident? "
                 "Consider at least one higher and one lower severity alternative."
             ),
+            capture_provenance=capture_provenance,
         )
 
         investigation, investigation_id, records["investigation-agent"], calls["investigation-agent"] = run_agent(
@@ -614,6 +684,7 @@ def run_simulation(model_name: str, ops_db: Path, kb_dir: Path, enable_web: bool
                 "Which root-cause hypothesis best explains the evidence? Each competing hypothesis is a candidate."
             ),
             parent_task_id=triage_id,
+            capture_provenance=capture_provenance,
         )
 
         plan, planning_id, records["remediation-planning-agent"], calls["remediation-planning-agent"] = run_agent(
@@ -636,6 +707,7 @@ def run_simulation(model_name: str, ops_db: Path, kb_dir: Path, enable_web: bool
                 "Each distinct strategy, such as rollback, configuration fix, or queue drain, is a candidate."
             ),
             parent_task_id=investigation_id,
+            capture_provenance=capture_provenance,
         )
 
         # No tools: this agent decides from what the others concluded, so its capture finds
@@ -663,6 +735,7 @@ def run_simulation(model_name: str, ops_db: Path, kb_dir: Path, enable_web: bool
             decision_question="Should the proposed remediation be executed, modified, or rejected?",
             parent_task_id=planning_id,
             fixed_candidates=COMMANDER_CANDIDATES,
+            capture_provenance=capture_provenance,
         )
 
     connection.close()
@@ -706,12 +779,17 @@ def build_report(workflow_id: str, final_decision: str, records: dict, calls: di
     return {
         "workflow_id": workflow_id,
         "final_decision": final_decision,
+        # A baseline run has no decision records; the absent keys are the finding, so they
+        # are left out rather than filled with placeholders.
         "agents": [
             {
                 "agent_id": agent_id,
                 "tool_calls": calls.get(agent_id, []),
-                "grounding": record.grounding_summary(),
-                "decision": record.to_dict(),
+                **(
+                    {"grounding": record.grounding_summary(), "decision": record.to_dict()}
+                    if record is not None
+                    else {}
+                ),
             }
             for agent_id, record in records.items()
         ],
@@ -787,14 +865,21 @@ def print_trace(tasks: list[dict]) -> None:
 def report(args, workflow_id: str, final_decision: str, records: dict, calls: dict) -> list[dict]:
     """Print the run and return the captured tasks, so the caller can also save them."""
     for agent_id, record in records.items():
-        summary = record.grounding_summary()
         print(f"\n=== {agent_id} ===")
+        for call in calls.get(agent_id, []):
+            detail = {key: value for key, value in call.items() if key != "tool"}
+            print(f"  called {call['tool']} with {json.dumps(detail, default=str)}")
+
+        if record is None:
+            # Baseline mode: the tools ran, but nothing records what came back or what the
+            # agent did with it. That absence is the point of the comparison.
+            print("  no decision record captured (baseline mode)")
+            continue
+
+        summary = record.grounding_summary()
         if not summary["tools_used"]:
             print("  no tools; decided from upstream agent reports")
         else:
-            for call in calls[agent_id]:
-                detail = {key: value for key, value in call.items() if key != "tool"}
-                print(f"  called {call['tool']} with {json.dumps(detail, default=str)}")
             print(f"  retrieved {summary['retrieved_count']}, kept {len(summary['kept_item_ids'])}")
             for use in record.evidence_uses:
                 verdict = "KEPT" if use.used else "DROPPED"
@@ -821,6 +906,16 @@ def main() -> None:
     parser.add_argument("--web-search", action="store_true", help="Also offer the investigator a live web search.")
     parser.add_argument("--no-trace", dest="trace", action="store_false", help="Print only the summary.")
     parser.add_argument(
+        "--capture-mode",
+        choices=("extended", "baseline"),
+        default="extended",
+        help=(
+            "extended: capture tool retrievals and decision records. "
+            "baseline: same agents, same tools, same model, captured the way Flowcept did "
+            "before this extension — model invocations only."
+        ),
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         default=DEFAULT_OUT_DIR,
@@ -831,15 +926,18 @@ def main() -> None:
     parser.add_argument("--no-save", dest="save", action="store_false", help="Do not write the run to disk.")
     args = parser.parse_args()
 
-    workflow_id, final_decision, records, calls = run_simulation(args.model, args.ops_db, args.kb, args.web_search)
+    workflow_id, final_decision, records, calls = run_simulation(
+        args.model, args.ops_db, args.kb, args.web_search, capture_provenance=args.capture_mode == "extended"
+    )
 
     # The workflow id only exists once the run has started, so the default filenames are
-    # derived here rather than asked for up front.
+    # derived here rather than asked for up front. The mode is in the filename so two runs
+    # can be told apart without opening them.
     out_txt = args.out_txt
     out_json = args.out_json
     if args.save:
-        out_txt = out_txt or args.out_dir / f"{workflow_id}.txt"
-        out_json = out_json or args.out_dir / f"{workflow_id}.json"
+        out_txt = out_txt or args.out_dir / f"{args.capture_mode}_{workflow_id}.txt"
+        out_json = out_json or args.out_dir / f"{args.capture_mode}_{workflow_id}.json"
 
     if out_txt:
         out_txt.parent.mkdir(parents=True, exist_ok=True)

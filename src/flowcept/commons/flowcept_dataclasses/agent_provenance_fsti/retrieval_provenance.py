@@ -1,5 +1,8 @@
 """Domain-agnostic retrieval provenance data models.
 
+Added at Ferdinand-Steinbeis-Institut as part of the agent retrieval-provenance extension;
+not part of upstream Flowcept. See ``docs/agent_retrieval_provenance.md``.
+
 A retrieval is what an agent's tool brought back before it decided anything: the tool
 that ran, the query it ran, and every item it returned. Those items are the "ground
 truth" the decision is measured against, so they are recorded in full and separately

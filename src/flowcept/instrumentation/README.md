@@ -9,8 +9,10 @@ Explicit provenance capture APIs used directly in user code.
 - `flowcept_loop.py`: `FlowceptLoop` and lightweight loop capture.
 - `flowcept_torch.py`: PyTorch module, epoch, batch, and child-layer capture.
 - `flowcept_agent_task.py`: agent-aware task wrapper.
-- `decision_provenance.py`: manual and LLM-assisted `DecisionCapture` context manager.
-- `tool_provenance.py`: `@flowcept_tool`, `FlowceptTool`, `retrieval_scope`, and `ToolCapture` for agent tool calls and what they retrieved.
+- `agent_provenance_fsti/`: the FSTI agent-provenance extension (not upstream Flowcept).
+  - `decision_provenance.py`: manual and LLM-assisted `DecisionCapture` context manager.
+  - `decision_response.py`: the validated LLM output contracts.
+  - `tool_provenance.py`: `@flowcept_tool`, `FlowceptTool`, `retrieval_scope`, and `ToolCapture` for agent tool calls and what they retrieved.
 - `task_capture.py`: lower-level task capture helpers.
 
 ## Choosing An API

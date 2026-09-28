@@ -1,14 +1,18 @@
-"""Capture generic decision provenance through Flowcept tasks."""
+"""Capture generic decision provenance through Flowcept tasks.
+
+Added at Ferdinand-Steinbeis-Institut as part of the agent decision-provenance extension;
+not part of upstream Flowcept. See ``docs/agent_retrieval_provenance.md``.
+"""
 
 import json
 from uuid import uuid4
 
-from flowcept.commons.flowcept_dataclasses.decision_provenance import (
+from flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.decision_provenance import (
     Assessment,
     Candidate,
     DecisionRecord,
 )
-from flowcept.commons.flowcept_dataclasses.retrieval_provenance import (
+from flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.retrieval_provenance import (
     EvidenceUse,
     Retrieval,
 )
@@ -86,7 +90,7 @@ class DecisionCapture:
         # MAS gets grounded decisions without threading retrievals through its call stack.
         # An explicit empty list still means "no evidence", which is how an agent that uses
         # no tools keeps the plain decision contract.
-        from flowcept.instrumentation.tool_provenance import current_retrievals
+        from flowcept.instrumentation.agent_provenance_fsti.tool_provenance import current_retrievals
 
         self.retrievals = list(retrievals) if retrievals is not None else current_retrievals()
         self.evidence_uses = []
@@ -204,7 +208,10 @@ class DecisionCapture:
             raise ValueError("Attach an llm to DecisionCapture before invoking it")
         self._check_automatic_capture()
         # Keep optional LLM dependencies out of manual capture and package imports.
-        from flowcept.instrumentation.decision_response import DecisionResponse, GroundedDecisionResponse
+        from flowcept.instrumentation.agent_provenance_fsti.decision_response import (
+            DecisionResponse,
+            GroundedDecisionResponse,
+        )
         from flowcept.instrumentation.flowcept_agent_task import FlowceptLLM
 
         # With retrievals attached, the model is held to the grounded contract, which adds
@@ -248,7 +255,10 @@ class DecisionCapture:
         """
         self._check_automatic_capture()
         # Pydantic is provided by the optional LLM dependencies.
-        from flowcept.instrumentation.decision_response import DecisionResponse, GroundedDecisionResponse
+        from flowcept.instrumentation.agent_provenance_fsti.decision_response import (
+            DecisionResponse,
+            GroundedDecisionResponse,
+        )
 
         self._automatic = True
         response_model = GroundedDecisionResponse if self.retrievals else DecisionResponse

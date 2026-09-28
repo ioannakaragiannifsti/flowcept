@@ -4,12 +4,12 @@ No LLM and no running services are needed by default: the tool results and the
 keep/drop verdicts are supplied by hand, so the example prints the same task
 documents that would otherwise be produced by a model and written to MongoDB.
 
-    python examples/tool_provenance_example.py
+    python examples/decision_examples/tool_provenance_example.py
 
 With Redis and MongoDB up (``make services``), add ``--persist`` to send the same
 tasks through the real pipeline and read them back out of MongoDB:
 
-    python examples/tool_provenance_example.py --persist
+    python examples/decision_examples/tool_provenance_example.py --persist
 """
 
 import argparse

@@ -3,7 +3,7 @@ import json
 import pytest
 
 from flowcept import Assessment, DecisionCapture, DecisionRecord, Flowcept, record_decision
-from flowcept.commons.flowcept_dataclasses.decision_provenance import Candidate
+from flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.decision_provenance import Candidate
 
 
 def test_candidate_serialization():
@@ -142,7 +142,7 @@ def test_automatic_capture_requires_attachment():
 
 def test_decision_prompt_uses_validated_contract():
     """Build the prompt from the same schema used to validate model output."""
-    from flowcept.instrumentation.decision_response import DecisionResponse
+    from flowcept.instrumentation.agent_provenance_fsti.decision_response import DecisionResponse
 
     prompt = DecisionResponse.build_prompt("selection", {"criteria": ["quality"]})
     assert json.loads(prompt.split("JSON schema: ")[1]) == DecisionResponse.model_json_schema()
@@ -151,7 +151,7 @@ def test_decision_prompt_uses_validated_contract():
 
 def test_provider_response_format_requires_assessments_and_selection():
     """The provider contract must prohibit the empty lists observed in Ollama output."""
-    from flowcept.instrumentation.decision_response import DecisionResponse
+    from flowcept.instrumentation.agent_provenance_fsti.decision_response import DecisionResponse
 
     response_format = DecisionResponse.response_format()
     assert response_format["type"] == "json_schema"

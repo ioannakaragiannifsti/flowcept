@@ -1,11 +1,18 @@
-"""Validated LLM output contract, separate from runtime provenance metadata."""
+"""Validated LLM output contract, separate from runtime provenance metadata.
+
+Added at Ferdinand-Steinbeis-Institut as part of the agent decision-provenance extension;
+not part of upstream Flowcept. See ``docs/agent_retrieval_provenance.md``.
+"""
 
 import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from flowcept.commons.flowcept_dataclasses.retrieval_provenance import DISCARDING_ROLES, EVIDENCE_ROLES
+from flowcept.commons.flowcept_dataclasses.agent_provenance_fsti.retrieval_provenance import (
+    DISCARDING_ROLES,
+    EVIDENCE_ROLES,
+)
 
 
 class _ResponseModel(BaseModel):
@@ -136,9 +143,7 @@ class GroundedDecisionResponse(DecisionResponse):
         # "I used it" and "it was irrelevant" cannot both be true. Recording the pair would
         # make kept_item_ids overcount and the stored reason contradict the stored verdict,
         # so the response is rejected and the caller can retry instead.
-        contradictions = [
-            use.item_id for use in self.evidence_uses if use.used and use.role in DISCARDING_ROLES
-        ]
+        contradictions = [use.item_id for use in self.evidence_uses if use.used and use.role in DISCARDING_ROLES]
         if contradictions:
             raise ValueError(
                 f"Items marked used cannot have a discarding role {sorted(DISCARDING_ROLES)}: {contradictions}. "

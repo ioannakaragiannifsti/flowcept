@@ -338,12 +338,58 @@ is kept whole rather than split per field.
 
 ---
 
-## 8. Reference
+## 8. What this extension adds to Flowcept
 
-**Modules** — `commons/flowcept_dataclasses/retrieval_provenance.py`,
-`commons/flowcept_dataclasses/decision_provenance.py`,
-`instrumentation/tool_provenance.py`, `instrumentation/decision_provenance.py`,
-`instrumentation/decision_response.py`.
+Everything below was added at **Ferdinand-Steinbeis-Institut (FSTI)**. Everything not listed
+is upstream Flowcept. The authoritative, drift-proof version of this list is
+`git diff --name-status main...HEAD`; this table exists so a reader can see the boundary
+without git.
+
+### Files added (wholly FSTI)
+
+| File | Contents |
+| --- | --- |
+| `commons/flowcept_dataclasses/agent_provenance_fsti/decision_provenance.py` | `Candidate`, `Assessment`, `DecisionRecord` |
+| `commons/flowcept_dataclasses/agent_provenance_fsti/retrieval_provenance.py` | `RetrievedItem`, `Retrieval`, `EvidenceUse`, `TOOL_TYPES`, `EVIDENCE_ROLES`, `DISCARDING_ROLES` |
+| `instrumentation/agent_provenance_fsti/decision_provenance.py` | `record_decision`, `DecisionCapture` |
+| `instrumentation/agent_provenance_fsti/decision_response.py` | `DecisionResponse`, `GroundedDecisionResponse` |
+| `instrumentation/agent_provenance_fsti/tool_provenance.py` | `@flowcept_tool`, `ToolCapture`, `FlowceptTool`, `retrieval_scope`, `propagate_scope`, `normalize_retrieved_items`, `record_retrieval` |
+| `ui/src/lib/decisionCandidates.ts` | decision-graph builder |
+| `ui/src/lib/toolUsage.ts` | Tools-tab row builder |
+| `ui/src/components/charts/DecisionCandidatesView.tsx` | decision-graph view |
+| `tests/instrumentation_tests/decision_provenance_test.py` | decision capture |
+| `tests/instrumentation_tests/tool_provenance_test.py` | tool capture |
+| `tests/instrumentation_tests/tool_capture_auto_test.py` | automatic capture, normalizer, limits |
+| `ui/tests/decisionCandidates.test.ts`, `ui/tests/toolUsage.test.ts` | UI logic |
+| `examples/decision_examples/*` (decision and tool examples), `examples/data/` | runnable usage |
+| `docs/agent_retrieval_provenance.md` | this document |
+
+### Edits inside upstream files
+
+These cannot be relocated into a separate folder, which is why this list matters:
+
+| File | Edit |
+| --- | --- |
+| `commons/vocabulary.py` | added `PROV_AGENT.DECISION` |
+| `flowcept/__init__.py` | lazy exports for all names above |
+| `commons/flowcept_dataclasses/agent_provenance_fsti/decision_provenance.py` | `DecisionRecord` gained `retrievals`, `evidence_uses`, `grounding_summary()` |
+| `ui/src/routes/workflows.$workflowId.tsx` | `Tools` tab and `TOOL_USAGE_COLS`; mounts `DecisionCandidatesView` |
+| `instrumentation/README.md` | tool-retrieval and grounded-decision sections |
+| `.gitignore` | `runs/` |
+
+### Deliberately unchanged
+
+No storage, transport or interceptor code was modified. Tool and decision records travel the
+existing `FlowceptTask` → interceptor → Redis → `DocumentInserter` → MongoDB path, and
+`FlowceptLLM` captures model calls as it already did. `PROV_AGENT.AGENT_TOOL` and
+`ai_model_invocation` are upstream vocabulary reused as-is.
+
+## 9. Reference
+
+**Modules** — `commons/flowcept_dataclasses/agent_provenance_fsti/retrieval_provenance.py`,
+`commons/flowcept_dataclasses/agent_provenance_fsti/decision_provenance.py`,
+`instrumentation/agent_provenance_fsti/tool_provenance.py`, `instrumentation/agent_provenance_fsti/decision_provenance.py`,
+`instrumentation/agent_provenance_fsti/decision_response.py`.
 
 **Examples** — `examples/tool_provenance_example.py` (no model or services needed),
 `examples/local_llm_tool_grounded_example.py` (four agents, real tool calls, local Qwen).
